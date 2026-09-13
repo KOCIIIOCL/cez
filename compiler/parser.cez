@@ -302,6 +302,16 @@ func (p *Parser) ParseStmt() *Node {
         return defer_node
     }
 
+    if tok.kind == TOK_BREAK {
+        p.Advance()
+        return AllocNode(p.arena, NODE_BREAK, tok.line, tok.col)
+    }
+
+    if tok.kind == TOK_CONTINUE {
+        p.Advance()
+        return AllocNode(p.arena, NODE_CONTINUE, tok.line, tok.col)
+    }
+
     if tok.kind == TOK_VAR {
         p.Advance()
         v_name := p.Advance().str_val

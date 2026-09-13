@@ -18,6 +18,8 @@ const NODE_DEFER         int = 124
 const NODE_IF            int = 125
 const NODE_FOR           int = 126
 const NODE_EXPR_STMT     int = 127
+const NODE_BREAK         int = 128
+const NODE_CONTINUE      int = 129
 
 const NODE_BINARY        int = 140
 const NODE_UNARY         int = 141

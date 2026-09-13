@@ -7,40 +7,66 @@ func main(argc int, argv **i8) int {
     puts("=== Cez Self-Hosted Compiler (Stage 1) ===")
 
     if argc < 2 {
-        puts("Usage: cez-stage1 <source.cez> [-o <output>]")
+        puts("Usage: cez-stage1 <source1.cez> [source2.cez ...] [-o <output>]")
         return 1
     }
 
-    input_path := *(**i8)(uintptr(argv) + 8) // argv[1]
     var output_bin *i8 = "a.out"
+    var files_count int = 0
 
-    if argc >= 4 {
-        flag := *(**i8)(uintptr(argv) + 16) // argv[2]
-        if StrEq(flag, "-o") {
-            output_bin = *(**i8)(uintptr(argv) + 24) // argv[3]
-        }
-    }
-
-    printf("[Cez] Reading input file: %s\n", input_path)
-    file := ReadFile(input_path)
-    if uintptr(file.data) == 0 {
-        printf("[Cez Error] Could not read file '%s'\n", input_path)
-        return 1
-    }
-
-    printf("[Cez] File loaded successfully (%lu bytes)\n", file.size)
-
-    // Allocate 16MB Arena for compilation
-    arena_buf := malloc(16 * 1024 * 1024)
+    // Allocate 64MB Arena for multi-file compilation
+    arena_buf := malloc(64 * 1024 * 1024)
     var arena Arena
-    arena.Init(arena_buf, 16 * 1024 * 1024)
+    arena.Init(arena_buf, 64 * 1024 * 1024)
     defer free(arena_buf)
 
-    // Parse
-    printf("[Cez] Parsing source AST...\n")
-    var parser Parser
-    parser.Init(file.data, file.size, &arena)
-    root := parser.ParseProgram()
+    root := AllocNode(&arena, NODE_PROGRAM, 1, 1)
+    var last_decl *Node = (*Node)(uintptr(0))
+
+    var i int = 1
+    for i < argc {
+        arg := *(**i8)(uintptr(argv) + usize(i) * 8)
+        if StrEq(arg, "-o") {
+            if i + 1 < argc {
+                output_bin = *(**i8)(uintptr(argv) + usize(i + 1) * 8)
+                i += 2
+                continue
+            }
+        }
+
+        printf("[Cez] Loading: %s\n", arg)
+        file := ReadFile(arg)
+        if uintptr(file.data) == 0 {
+            printf("[Cez Error] Could not read file '%s'\n", arg)
+            return 1
+        }
+
+        var parser Parser
+        parser.Init(file.data, file.size, &arena)
+        file_ast := parser.ParseProgram()
+
+        // Append file_ast declarations to root
+        decl := file_ast.body
+        for uintptr(decl) != 0 {
+            next_decl := decl.next
+            decl.next = (*Node)(uintptr(0))
+            if uintptr(last_decl) == 0 {
+                root.body = decl
+            } else {
+                last_decl.next = decl
+            }
+            last_decl = decl
+            decl = next_decl
+        }
+
+        files_count += 1
+        i += 1
+    }
+
+    if files_count == 0 {
+        puts("[Cez Error] No input files specified")
+        return 1
+    }
 
     // Codegen to /tmp/stage1_out.ll
     temp_ll := "/tmp/stage1_out.ll"

@@ -13,6 +13,9 @@ type Codegen struct {
     defers            [32]*Node
     str_count         int
     strings           [128]*i8
+    loop_count        int
+    loop_posts        [32]int
+    loop_exits        [32]int
     current_func_name *i8
     func_returned     bool
 }
@@ -23,6 +26,7 @@ func (c *Codegen) Init(out_fp *i8) {
     c.lbl_id = 1
     c.defer_count = 0
     c.str_count = 0
+    c.loop_count = 0
     c.func_returned = false
 }
 
@@ -36,6 +40,34 @@ func (c *Codegen) NewLabel() int {
     l := c.lbl_id
     c.lbl_id += 1
     return l
+}
+
+func (c *Codegen) PushLoop(post_lbl int, exit_lbl int) {
+    if c.loop_count < 32 {
+        c.loop_posts[c.loop_count] = post_lbl
+        c.loop_exits[c.loop_count] = exit_lbl
+        c.loop_count += 1
+    }
+}
+
+func (c *Codegen) PopLoop() {
+    if c.loop_count > 0 {
+        c.loop_count -= 1
+    }
+}
+
+func (c *Codegen) GetLoopPost() int {
+    if c.loop_count > 0 {
+        return c.loop_posts[c.loop_count - 1]
+    }
+    return 0
+}
+
+func (c *Codegen) GetLoopExit() int {
+    if c.loop_count > 0 {
+        return c.loop_exits[c.loop_count - 1]
+    }
+    return 0
 }
 
 func (c *Codegen) EmitPreamble() {
@@ -82,11 +114,35 @@ func (c *Codegen) GenerateFunc(f *Node) {
     c.current_func_name = f.name
     c.func_returned = false
 
-    fprintf(c.out_fp, "define i32 @%s()", f.name)
+    ret_ty := "i64"
+    if StrEq(f.name, "main") {
+        ret_ty = "i32"
+    }
+
+    fprintf(c.out_fp, "define %s @%s(", ret_ty, f.name)
+    p_node := f.args
+    var p_idx int = 0
+    for uintptr(p_node) != 0 {
+        if p_idx > 0 {
+            fputs(", ", c.out_fp)
+        }
+        fprintf(c.out_fp, "i64 %%arg.%s", p_node.name)
+        p_idx += 1
+        p_node = p_node.next
+    }
+    fputs(")", c.out_fp)
     if f.int_val == 1 {
         fputs(" naked", c.out_fp)
     }
     fputs(" {\nentry:\n", c.out_fp)
+
+    // Store parameters into allocas
+    p_node = f.args
+    for uintptr(p_node) != 0 {
+        fprintf(c.out_fp, "  %%%s = alloca i64, align 8\n", p_node.name)
+        fprintf(c.out_fp, "  store i64 %%arg.%s, i64* %%%s, align 8\n", p_node.name, p_node.name)
+        p_node = p_node.next
+    }
 
     // Body
     if uintptr(f.body) != 0 {
@@ -99,7 +155,11 @@ func (c *Codegen) GenerateFunc(f *Node) {
 
     if !c.func_returned {
         c.ExecuteDefers()
-        fputs("  ret i32 0\n", c.out_fp)
+        if StrEq(f.name, "main") {
+            fputs("  ret i32 0\n", c.out_fp)
+        } else {
+            fputs("  ret i64 0\n", c.out_fp)
+        }
     }
 
     fputs("}\n\n", c.out_fp)
@@ -125,15 +185,37 @@ func (c *Codegen) GenerateStmt(stmt *Node) {
     } else if stmt.kind == NODE_ASSIGN {
         val_reg := c.GenerateExpr(stmt.right)
         target_name := stmt.left.name
-        fprintf(c.out_fp, "  store i64 %%%s, i64* %%%s, align 8\n", val_reg, target_name)
+        if stmt.op == TOK_PLUS_ASSIGN {
+            cur_reg := c.NewReg()
+            add_reg := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = load i64, i64* %%%s, align 8\n", cur_reg, target_name)
+            fprintf(c.out_fp, "  %%r%d = add i64 %%r%d, %%%s\n", add_reg, cur_reg, val_reg)
+            val_reg_name := malloc(32)
+            sprintf(val_reg_name, "r%d", add_reg)
+            fprintf(c.out_fp, "  store i64 %%%s, i64* %%%s, align 8\n", (*i8)(uintptr(val_reg_name)), target_name)
+        } else if stmt.op == TOK_MINUS_ASSIGN {
+            cur_reg := c.NewReg()
+            sub_reg := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = load i64, i64* %%%s, align 8\n", cur_reg, target_name)
+            fprintf(c.out_fp, "  %%r%d = sub i64 %%r%d, %%%s\n", sub_reg, cur_reg, val_reg)
+            val_reg_name := malloc(32)
+            sprintf(val_reg_name, "r%d", sub_reg)
+            fprintf(c.out_fp, "  store i64 %%%s, i64* %%%s, align 8\n", (*i8)(uintptr(val_reg_name)), target_name)
+        } else {
+            fprintf(c.out_fp, "  store i64 %%%s, i64* %%%s, align 8\n", val_reg, target_name)
+        }
     } else if stmt.kind == NODE_RETURN {
         var ret_reg *i8 = "0"
         if uintptr(stmt.left) != 0 {
             ret_reg = c.GenerateExpr(stmt.left)
         }
         c.ExecuteDefers()
-        fprintf(c.out_fp, "  %%ret.trunc = trunc i64 %%%s to i32\n", ret_reg)
-        fprintf(c.out_fp, "  ret i32 %%ret.trunc\n")
+        if StrEq(c.current_func_name, "main") {
+            fprintf(c.out_fp, "  %%ret.trunc = trunc i64 %%%s to i32\n", ret_reg)
+            fprintf(c.out_fp, "  ret i32 %%ret.trunc\n")
+        } else {
+            fprintf(c.out_fp, "  ret i64 %%%s\n", ret_reg)
+        }
         c.func_returned = true
     } else if stmt.kind == NODE_DEFER {
         if c.defer_count < 32 {
@@ -174,6 +256,56 @@ func (c *Codegen) GenerateStmt(stmt *Node) {
         }
 
         fprintf(c.out_fp, "lbl.%d:\n", lbl_end)
+    } else if stmt.kind == NODE_FOR {
+        lbl_cond := c.NewLabel()
+        lbl_body := c.NewLabel()
+        lbl_post := c.NewLabel()
+        lbl_exit := c.NewLabel()
+
+        if uintptr(stmt.init) != 0 {
+            c.GenerateStmt(stmt.init)
+        }
+
+        fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_cond)
+
+        // Cond
+        fprintf(c.out_fp, "lbl.%d:\n", lbl_cond)
+        if uintptr(stmt.cond) != 0 {
+            cond_reg := c.GenerateExpr(stmt.cond)
+            fprintf(c.out_fp, "  br i1 %%%s, label %%lbl.%d, label %%lbl.%d\n", cond_reg, lbl_body, lbl_exit)
+        } else {
+            fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_body)
+        }
+
+        c.PushLoop(lbl_post, lbl_exit)
+
+        // Body
+        fprintf(c.out_fp, "lbl.%d:\n", lbl_body)
+        if uintptr(stmt.body) != 0 {
+            body_stmt := stmt.body.body
+            for uintptr(body_stmt) != 0 {
+                c.GenerateStmt(body_stmt)
+                body_stmt = body_stmt.next
+            }
+        }
+        c.PopLoop()
+        fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_post)
+
+        // Post
+        fprintf(c.out_fp, "lbl.%d:\n", lbl_post)
+        if uintptr(stmt.post) != 0 {
+            c.GenerateStmt(stmt.post)
+        }
+        fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_cond)
+
+        // Exit
+        fprintf(c.out_fp, "lbl.%d:\n", lbl_exit)
+    } else if stmt.kind == NODE_BREAK {
+        exit_lbl := c.GetLoopExit()
+        fprintf(c.out_fp, "  br label %%lbl.%d\n", exit_lbl)
+    } else if stmt.kind == NODE_CONTINUE {
+        post_lbl := c.GetLoopPost()
+        fprintf(c.out_fp, "  br label %%lbl.%d\n", post_lbl)
     } else if stmt.kind == NODE_EXPR_STMT {
         c.GenerateExpr(stmt.left)
     }
@@ -221,10 +353,18 @@ func (c *Codegen) GenerateExpr(expr *Node) *i8 {
         if expr.op == TOK_MINUS { op_str = "sub" }
         if expr.op == TOK_STAR { op_str = "mul" }
         if expr.op == TOK_SLASH { op_str = "sdiv" }
+        if expr.op == TOK_PERCENT { op_str = "srem" }
+        if expr.op == TOK_AMP { op_str = "and" }
+        if expr.op == TOK_PIPE { op_str = "or" }
+        if expr.op == TOK_CARET { op_str = "xor" }
+        if expr.op == TOK_SHL { op_str = "shl" }
+        if expr.op == TOK_SHR { op_str = "ashr" }
         if expr.op == TOK_EQ { op_str = "icmp eq" }
         if expr.op == TOK_NOT_EQ { op_str = "icmp ne" }
         if expr.op == TOK_LT { op_str = "icmp slt" }
+        if expr.op == TOK_LT_EQ { op_str = "icmp sle" }
         if expr.op == TOK_GT { op_str = "icmp sgt" }
+        if expr.op == TOK_GT_EQ { op_str = "icmp sge" }
 
         fprintf(c.out_fp, "  %%r%d = %s i64 %%%s, %%%s\n", res_reg, op_str, l_reg, r_reg)
         buf := malloc(32)
@@ -236,12 +376,43 @@ func (c *Codegen) GenerateExpr(expr *Node) *i8 {
         func_name := expr.left.name
         res_reg := c.NewReg()
 
-        // Single argument call e.g. puts(str)
-        if uintptr(expr.args) != 0 {
-            arg_reg := c.GenerateExpr(expr.args)
-            fprintf(c.out_fp, "  %%r%d = call i32 @%s(i8* %%%s)\n", res_reg, func_name, arg_reg)
+        // Evaluate arguments
+        var arg_regs [8]*i8
+        var arg_is_str [8]bool
+        var arg_count int = 0
+        arg_node := expr.args
+        for uintptr(arg_node) != 0 && arg_count < 8 {
+            arg_regs[arg_count] = c.GenerateExpr(arg_node)
+            arg_is_str[arg_count] = (arg_node.kind == NODE_STR_LIT)
+            arg_count += 1
+            arg_node = arg_node.next
+        }
+
+        if StrEq(func_name, "printf") {
+            fprintf(c.out_fp, "  %%r%d = call i32 (i8*, ...) @printf(i8* %%%s", res_reg, arg_regs[0])
+            var a_idx int = 1
+            for a_idx < arg_count {
+                fprintf(c.out_fp, ", i64 %%%s", arg_regs[a_idx])
+                a_idx += 1
+            }
+            fputs(")\n", c.out_fp)
+        } else if StrEq(func_name, "puts") {
+            fprintf(c.out_fp, "  %%r%d = call i32 @puts(i8* %%%s)\n", res_reg, arg_regs[0])
         } else {
-            fprintf(c.out_fp, "  %%r%d = call i32 @%s()\n", res_reg, func_name)
+            fprintf(c.out_fp, "  %%r%d = call i64 @%s(", res_reg, func_name)
+            var a_idx int = 0
+            for a_idx < arg_count {
+                if a_idx > 0 {
+                    fputs(", ", c.out_fp)
+                }
+                if arg_is_str[a_idx] {
+                    fprintf(c.out_fp, "i8* %%%s", arg_regs[a_idx])
+                } else {
+                    fprintf(c.out_fp, "i64 %%%s", arg_regs[a_idx])
+                }
+                a_idx += 1
+            }
+            fputs(")\n", c.out_fp)
         }
 
         buf := malloc(32)
