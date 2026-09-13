@@ -1,0 +1,68 @@
+package main
+
+extern func printf(fmt *i8, ...) i32
+extern func puts(s *i8) i32
+
+// ANSI Color constants
+const ANSI_RESET   *i8 = "\x1b[0m"
+const ANSI_BOLD    *i8 = "\x1b[1m"
+const ANSI_CYAN    *i8 = "\x1b[36m"
+const ANSI_GREEN   *i8 = "\x1b[32m"
+const ANSI_YELLOW  *i8 = "\x1b[33m"
+const ANSI_MAGENTA *i8 = "\x1b[35m"
+
+type ServiceStatus struct {
+    name    *i8
+    port    u16
+    active  bool
+    queries u32
+}
+
+func (s *ServiceStatus) Render() {
+    status_str := "\x1b[32mACTIVE\x1b[0m"
+    if !s.active {
+        status_str = "\x1b[31mSTOPPED\x1b[0m"
+    }
+
+    printf("  │ %-15s │ Port: %-5u │ Status: %-18s │ Queries: %-6u │\n",
+           s.name, u32(s.port), status_str, s.queries)
+}
+
+func main() int {
+    // Ensure terminal color and attributes are reset on function exit
+    defer printf("%s\n", ANSI_RESET)
+
+    printf("%s%s┌────────────────────────────────────────────────────────────────────────┐%s\n", ANSI_BOLD, ANSI_CYAN, ANSI_RESET)
+    printf("%s%s│                      CEZ SYSTEM SERVER DASHBOARD                       │%s\n", ANSI_BOLD, ANSI_CYAN, ANSI_RESET)
+    printf("%s%s├────────────────────────────────────────────────────────────────────────┤%s\n", ANSI_BOLD, ANSI_CYAN, ANSI_RESET)
+
+    var http ServiceStatus = ServiceStatus{
+        name: "HTTP Gateway",
+        port: 8080,
+        active: true,
+        queries: 14205,
+    }
+
+    var dns ServiceStatus = ServiceStatus{
+        name: "DNS Resolver",
+        port: 53,
+        active: true,
+        queries: 9812,
+    }
+
+    var ssh ServiceStatus = ServiceStatus{
+        name: "Kernel Shell",
+        port: 2222,
+        active: false,
+        queries: 0,
+    }
+
+    http.Render()
+    dns.Render()
+    ssh.Render()
+
+    printf("%s%s└────────────────────────────────────────────────────────────────────────┘%s\n", ANSI_BOLD, ANSI_CYAN, ANSI_RESET)
+    printf("%s[Cez Runtime]%s All 3 low-level services inspected successfully.\n", ANSI_GREEN, ANSI_RESET)
+
+    return 0
+}

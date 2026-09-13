@@ -1,0 +1,70 @@
+package main
+
+// Multiboot 1 header specification
+const MB_MAGIC u32 = 0x1BADB002
+const MB_FLAGS u32 = 0x00000003
+
+type MultibootHeader struct @packed {
+    magic    u32
+    flags    u32
+    checksum u32
+}
+
+// Global Multiboot Header placed into .multiboot section
+var mb_header MultibootHeader @section(".multiboot") @align(4) = MultibootHeader{
+    magic: 0x1BADB002,
+    flags: 0x00000003,
+    checksum: 0xE4524FFB, // 0 - (MB_MAGIC + MB_FLAGS)
+}
+
+// Hardware Interrupt Descriptor Table (IDT) entry (x86_64)
+type IDTEntry struct @packed {
+    offset_low  u16
+    selector    u16
+    ist         u8
+    type_attr   u8
+    offset_mid  u16
+    offset_high u32
+    reserved    u32
+}
+
+// Global IDT table with 256 entries aligned on page boundary
+var idt_table [256]IDTEntry @align(4096)
+
+// Low-level port I/O routines using inline assembly
+func outb(port u16, val u8) {
+    inline_asm("outb %0, %1" : : "{al}"(val), "{dx}"(port))
+}
+
+func inb(port u16) u8 {
+    // Read byte from hardware port
+    inline_asm("inb %1, %0" : : "{al}"(u8(0)), "{dx}"(port))
+    return 0
+}
+
+// Naked interrupt service routine stub
+func isr_keyboard() @naked {
+    inline_asm("cli")
+    // Acknowledge interrupt to PIC
+    outb(0x20, 0x20)
+    inline_asm("iretq")
+}
+
+// Kernel entrypoint
+func kernel_entry() @export("_start") @naked {
+    inline_asm("cli")
+
+    // VGA Text Mode Buffer at 0xB8000
+    // Write "CEZ OS" in bright green on black (color 0x0A)
+    vga := (*u16)(uintptr(0xb8000))
+
+    // 'C' = 0x43
+    @volatile_store(vga, u16(0x0A43))
+    // 'E' = 0x45
+    @volatile_store((*u16)(uintptr(0xb8002)), u16(0x0A45))
+    // 'Z' = 0x5A
+    @volatile_store((*u16)(uintptr(0xb8004)), u16(0x0A5A))
+
+    // Halt the CPU
+    inline_asm("hlt")
+}

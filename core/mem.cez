@@ -1,0 +1,45 @@
+package core
+
+// Core low-level memory operations and arena allocator for Cez.
+// Freestanding friendly: works in both baremetal OS kernels and userland servers.
+
+extern func memcpy(dest *u8, src *u8, n usize) *u8
+extern func memset(dest *u8, val i32, n usize) *u8
+
+// Fast bump allocator (Arena)
+// Ideal for low-latency network servers and OS kernel allocators.
+type Arena struct {
+    buffer   *u8
+    capacity usize
+    offset   usize
+}
+
+func (a *Arena) Init(buf *u8, cap usize) {
+    a.buffer = buf
+    a.capacity = cap
+    a.offset = 0
+}
+
+func (a *Arena) Alloc(size usize) *u8 {
+    // 8-byte alignment
+    aligned_offset := (a.offset + 7) &^ 7
+    if aligned_offset + size > a.capacity {
+        return (*u8)(uintptr(0)) // Out of memory
+    }
+
+    ptr := (*u8)(uintptr(a.buffer) + aligned_offset)
+    a.offset = aligned_offset + size
+    return ptr
+}
+
+func (a *Arena) Reset() {
+    a.offset = 0
+}
+
+func (a *Arena) BytesUsed() usize {
+    return a.offset
+}
+
+func (a *Arena) BytesAvailable() usize {
+    return a.capacity - a.offset
+}
