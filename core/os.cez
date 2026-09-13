@@ -1,0 +1,96 @@
+package core
+
+// OS and file I/O primitives for Cez self-hosting and tooling.
+
+extern func fopen(filename *i8, mode *i8) *i8
+extern func fclose(stream *i8) i32
+extern func fseek(stream *i8, offset i64, whence i32) i32
+extern func ftell(stream *i8) i64
+extern func fread(ptr *u8, size usize, nmemb usize, stream *i8) usize
+extern func fwrite(ptr *u8, size usize, nmemb usize, stream *i8) usize
+extern func system(command *i8) i32
+extern func malloc(size usize) *u8
+extern func free(ptr *u8)
+
+type FileData struct {
+    data *u8
+    size usize
+}
+
+// ReadFile reads an entire file from disk into a newly allocated buffer.
+// Returns a FileData struct containing pointer and size.
+func ReadFile(path *i8) FileData {
+    mode := "rb"
+    fp := fopen(path, mode)
+    if uintptr(fp) == 0 {
+        return FileData{ data: (*u8)(uintptr(0)), size: 0 }
+    }
+
+    // Seek to end to determine file size
+    fseek(fp, 0, 2) // SEEK_END = 2
+    size := usize(ftell(fp))
+    fseek(fp, 0, 0) // SEEK_SET = 0
+
+    // Allocate buffer with an extra null-terminator byte for safety
+    buf := malloc(size + 1)
+    if uintptr(buf) == 0 {
+        fclose(fp)
+        return FileData{ data: (*u8)(uintptr(0)), size: 0 }
+    }
+
+    // Read file contents
+    read_bytes := fread(buf, 1, size, fp)
+    fclose(fp)
+
+    // Null terminate
+    zero_ptr := (*u8)(uintptr(buf) + read_bytes)
+    *zero_ptr = u8(0)
+
+    return FileData{ data: buf, size: read_bytes }
+}
+
+// WriteFile writes a buffer to a file. Returns true on success.
+func WriteFile(path *i8, data *u8, len usize) bool {
+    mode := "wb"
+    fp := fopen(path, mode)
+    if uintptr(fp) == 0 {
+        return false
+    }
+
+    written := fwrite(data, 1, len, fp)
+    fclose(fp)
+
+    return written == len
+}
+
+// Execute a shell command (e.g. clang)
+func Exec(cmd *i8) int {
+    return int(system(cmd))
+}
+
+// String length
+func StrLen(s *i8) usize {
+    var len usize = 0
+    ptr := (*u8)(uintptr(s))
+    for *ptr != u8(0) {
+        len += 1
+        ptr = (*u8)(uintptr(s) + len)
+    }
+    return len
+}
+
+// String equality
+func StrEq(a *i8, b *i8) bool {
+    var idx usize = 0
+    for {
+        ca := *((*u8)(uintptr(a) + idx))
+        cb := *((*u8)(uintptr(b) + idx))
+        if ca != cb {
+            return false
+        }
+        if ca == u8(0) {
+            return true
+        }
+        idx += 1
+    }
+}

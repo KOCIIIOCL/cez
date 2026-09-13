@@ -429,12 +429,15 @@ impl Sema {
                 } => {
                     let ty = self.resolve_type_node(&ty.unwrap())?;
                     let typed_init = if let Some(init_expr) = init {
-                        let typed_expr = self.check_expr(init_expr)?;
+                        let mut typed_expr = self.check_expr(init_expr)?;
                         if typed_expr.ty != ty && !self.can_coerce(&typed_expr.ty, &ty) {
                             return Err(format!(
                                 "Cannot initialize global '{}' of type '{}' with expression of type '{}' at {}",
                                 name, ty, typed_expr.ty, span
                             ));
+                        }
+                        if typed_expr.ty != ty {
+                            typed_expr = self.coerce_expr(typed_expr, ty.clone());
                         }
                         Some(typed_expr)
                     } else {
@@ -565,18 +568,24 @@ impl Sema {
                     None
                 };
 
-                let final_ty = match (explicit_ty, &typed_init) {
-                    (Some(t), Some(init)) => {
+                let (final_ty, final_init) = match (explicit_ty, typed_init) {
+                    (Some(t), Some(mut init)) => {
                         if t != init.ty && !self.can_coerce(&init.ty, &t) {
                             return Err(format!(
                                 "Cannot assign value of type '{}' to variable '{}' of type '{}' at {}",
                                 init.ty, name, t, span
                             ));
                         }
-                        t
+                        if t != init.ty {
+                            init = self.coerce_expr(init, t.clone());
+                        }
+                        (t, Some(init))
                     }
-                    (Some(t), None) => t,
-                    (None, Some(init)) => init.ty.clone(),
+                    (Some(t), None) => (t, None),
+                    (None, Some(init)) => {
+                        let ty = init.ty.clone();
+                        (ty, Some(init))
+                    }
                     (None, None) => {
                         return Err(format!("Variable '{}' requires either a type or an initializer at {}", name, span))
                     }
@@ -587,7 +596,7 @@ impl Sema {
                 Ok(TypedStmt::VarDecl {
                     name,
                     ty: final_ty,
-                    init: typed_init,
+                    init: final_init,
                     span,
                 })
             }
@@ -609,13 +618,16 @@ impl Sema {
                 span,
             } => {
                 let typed_target = self.check_expr(target)?;
-                let typed_val = self.check_expr(value)?;
+                let mut typed_val = self.check_expr(value)?;
 
                 if typed_target.ty != typed_val.ty && !self.can_coerce(&typed_val.ty, &typed_target.ty) {
                     return Err(format!(
                         "Cannot assign type '{}' to type '{}' at {}",
                         typed_val.ty, typed_target.ty, span
                     ));
+                }
+                if typed_target.ty != typed_val.ty {
+                    typed_val = self.coerce_expr(typed_val, typed_target.ty.clone());
                 }
 
                 Ok(TypedStmt::Assign {
@@ -628,12 +640,15 @@ impl Sema {
             Stmt::Return { value, span } => {
                 let expected_ret = self.current_ret_type.clone().unwrap_or(Type::Void);
                 let typed_val = if let Some(v) = value {
-                    let expr = self.check_expr(v)?;
+                    let mut expr = self.check_expr(v)?;
                     if expr.ty != expected_ret && !self.can_coerce(&expr.ty, &expected_ret) {
                         return Err(format!(
                             "Function returns '{}' but got '{}' at {}",
                             expected_ret, expr.ty, span
                         ));
+                    }
+                    if expr.ty != expected_ret {
+                        expr = self.coerce_expr(expr, expected_ret.clone());
                     }
                     Some(expr)
                 } else {
@@ -1119,28 +1134,32 @@ impl Sema {
             }
             Expr::MemberAccess(target, field_name, s) => {
                 let typed_target = self.check_expr(*target)?;
-                let (struct_type, is_pointer) = match &typed_target.ty {
-                    Type::Struct(st) => (st.clone(), false),
+                let (struct_name, is_pointer) = match &typed_target.ty {
+                    Type::Struct(st) => (st.name.clone(), false),
                     Type::Pointer(inner) => match &**inner {
-                        Type::Struct(st) => (st.clone(), true),
+                        Type::Struct(st) => (st.name.clone(), true),
                         _ => return Err(format!("Cannot access member on pointer to non-struct at {}", s)),
                     },
                     _ => return Err(format!("Cannot access member on non-struct type '{}' at {}", typed_target.ty, s)),
                 };
 
-                let (idx, field_ty) = struct_type
+                let struct_def = self.structs.get(&struct_name).cloned().ok_or_else(|| {
+                    format!("Struct '{}' not found at {}", struct_name, s)
+                })?;
+
+                let (idx, field_ty) = struct_def
                     .fields
                     .iter()
                     .enumerate()
                     .find(|(_, f)| f.name == field_name)
                     .map(|(i, f)| (i, f.ty.clone()))
-                    .ok_or_else(|| format!("Struct '{}' has no field '{}' at {}", struct_type.name, field_name, s))?;
+                    .ok_or_else(|| format!("Struct '{}' has no field '{}' at {}", struct_def.name, field_name, s))?;
 
                 let adjusted_target = if is_pointer {
                     // Auto-deref
                     TypedExpr {
                         kind: TypedExprKind::Unary(UnaryOp::Deref, Box::new(typed_target)),
-                        ty: Type::Struct(struct_type),
+                        ty: Type::Struct(struct_def),
                         span: s,
                     }
                 } else {
@@ -1231,7 +1250,7 @@ impl Sema {
             }
             Expr::StructLiteral { ty, fields, span: s } => {
                 let struct_ty = match self.resolve_type_node(&ty)? {
-                    Type::Struct(st) => st,
+                    Type::Struct(st) => self.structs.get(&st.name).cloned().unwrap_or(st),
                     _ => return Err(format!("Struct literal expects struct type at {}", s)),
                 };
 

@@ -1,0 +1,515 @@
+package main
+
+// Self-hosted Parser for Cez
+
+type Parser struct {
+    lexer   Lexer
+    cur_tok Token
+    arena   *Arena
+}
+
+func (p *Parser) Init(src *u8, len usize, arena *Arena) {
+    p.lexer.Init(src, len, arena)
+    p.arena = arena
+    p.cur_tok = p.lexer.NextToken()
+}
+
+func (p *Parser) Peek() int {
+    return p.cur_tok.kind
+}
+
+func (p *Parser) Advance() Token {
+    tok := p.cur_tok
+    p.cur_tok = p.lexer.NextToken()
+    return tok
+}
+
+func (p *Parser) SkipSemicolons() {
+    for p.Peek() == TOK_SEMICOLON {
+        p.Advance()
+    }
+}
+
+func (p *Parser) Consume(kind int) Token {
+    if p.cur_tok.kind == kind {
+        return p.Advance()
+    }
+    // Return current token on mismatch
+    return p.cur_tok
+}
+
+func (p *Parser) ParseTypeString() *i8 {
+    var stars int = 0
+    for p.Peek() == TOK_STAR {
+        p.Advance()
+        stars += 1
+    }
+
+    var base_name *i8 = (*i8)(uintptr(0))
+    if p.Peek() == TOK_IDENT {
+        base_name = p.Advance().str_val
+    } else {
+        base_name = "void"
+    }
+
+    if stars == 0 {
+        return base_name
+    }
+
+    base_len := StrLen(base_name)
+    buf := p.arena.Alloc(usize(stars) + base_len + 1)
+    var i int = 0
+    for i < stars {
+        *((*u8)(uintptr(buf) + usize(i))) = u8(42) // '*'
+        i += 1
+    }
+    memcpy((*u8)(uintptr(buf) + usize(stars)), (*u8)(uintptr(base_name)), base_len)
+    *((*u8)(uintptr(buf) + usize(stars) + base_len)) = u8(0)
+    return (*i8)(uintptr(buf))
+}
+
+func (p *Parser) ParseProgram() *Node {
+    p.SkipSemicolons()
+
+    root := AllocNode(p.arena, NODE_PROGRAM, p.cur_tok.line, p.cur_tok.col)
+    var last_decl *Node = (*Node)(uintptr(0))
+
+    // 1. package <name>
+    if p.Peek() == TOK_PACKAGE {
+        p.Advance()
+        pkg_name := p.Advance().str_val
+        p.SkipSemicolons()
+
+        pkg_node := AllocNode(p.arena, NODE_PACKAGE, 1, 1)
+        pkg_node.name = pkg_name
+        root.body = pkg_node
+        last_decl = pkg_node
+    }
+
+    // 2. imports and declarations
+    for p.Peek() != TOK_EOF {
+        p.SkipSemicolons()
+        if p.Peek() == TOK_EOF {
+            break
+        }
+
+        decl := p.ParseTopLevelDecl()
+        if uintptr(decl) != 0 {
+            if uintptr(last_decl) == 0 {
+                root.body = decl
+            } else {
+                last_decl.next = decl
+            }
+            last_decl = decl
+        }
+        p.SkipSemicolons()
+    }
+
+    return root
+}
+
+func (p *Parser) ParseTopLevelDecl() *Node {
+    p.SkipSemicolons()
+    tok := p.cur_tok
+
+    if tok.kind == TOK_IMPORT {
+        p.Advance()
+        imp_path := p.Advance().str_val
+        node := AllocNode(p.arena, NODE_IMPORT, tok.line, tok.col)
+        node.str_val = imp_path
+        return node
+    }
+
+    var is_extern bool = false
+    if tok.kind == TOK_EXTERN {
+        p.Advance()
+        is_extern = true
+    }
+
+    if p.Peek() == TOK_FUNC {
+        func_tok := p.Advance()
+        func_name := p.Advance().str_val
+
+        func_node := AllocNode(p.arena, NODE_FUNC, func_tok.line, func_tok.col)
+        func_node.name = func_name
+
+        // Parameters
+        p.Consume(TOK_LPAREN)
+        var last_param *Node = (*Node)(uintptr(0))
+        for p.Peek() != TOK_RPAREN && p.Peek() != TOK_EOF {
+            if p.Peek() == TOK_ELLIPSIS {
+                p.Advance()
+                break
+            }
+            p_name := p.Advance().str_val
+            p_type := p.ParseTypeString()
+
+            param_node := AllocNode(p.arena, NODE_VAR_DECL, 0, 0)
+            param_node.name = p_name
+            param_node.type_str = p_type
+
+            if uintptr(last_param) == 0 {
+                func_node.args = param_node
+            } else {
+                last_param.next = param_node
+            }
+            last_param = param_node
+
+            if p.Peek() == TOK_COMMA {
+                p.Advance()
+            }
+        }
+        p.Consume(TOK_RPAREN)
+
+        // Return type?
+        if p.Peek() == TOK_IDENT || p.Peek() == TOK_STAR {
+            func_node.type_str = p.ParseTypeString()
+        }
+
+        // Attributes (e.g. @naked, @export)
+        for p.Peek() >= TOK_AT_PACKED && p.Peek() <= TOK_AT_EXPORT {
+            attr_tok := p.Advance()
+            if attr_tok.kind == TOK_AT_NAKED {
+                func_node.int_val = 1 // naked flag
+            }
+        }
+
+        // Body
+        if !is_extern && p.Peek() == TOK_LBRACE {
+            func_node.body = p.ParseBlock()
+        }
+
+        return func_node
+    }
+
+    if tok.kind == TOK_TYPE {
+        p.Advance()
+        type_name := p.Advance().str_val
+        if p.Peek() == TOK_STRUCT {
+            p.Advance()
+            // Packed attribute?
+            var is_packed bool = false
+            if p.Peek() == TOK_AT_PACKED {
+                p.Advance()
+                is_packed = true
+            }
+
+            struct_node := AllocNode(p.arena, NODE_STRUCT_DEF, tok.line, tok.col)
+            struct_node.name = type_name
+            if is_packed {
+                struct_node.int_val = 1
+            }
+
+            p.Consume(TOK_LBRACE)
+            var last_field *Node = (*Node)(uintptr(0))
+            for p.Peek() != TOK_RBRACE && p.Peek() != TOK_EOF {
+                p.SkipSemicolons()
+                if p.Peek() == TOK_RBRACE {
+                    break
+                }
+                f_name := p.Advance().str_val
+                f_type := p.ParseTypeString()
+
+                field_node := AllocNode(p.arena, NODE_VAR_DECL, 0, 0)
+                field_node.name = f_name
+                field_node.type_str = f_type
+
+                if uintptr(last_field) == 0 {
+                    struct_node.body = field_node
+                } else {
+                    last_field.next = field_node
+                }
+                last_field = field_node
+                p.SkipSemicolons()
+            }
+            p.Consume(TOK_RBRACE)
+            return struct_node
+        }
+    }
+
+    if tok.kind == TOK_VAR || tok.kind == TOK_CONST {
+        is_const := tok.kind == TOK_CONST
+        p.Advance()
+        var_name := p.Advance().str_val
+        var var_type *i8 = (*i8)(uintptr(0))
+        if p.Peek() == TOK_IDENT || p.Peek() == TOK_STAR {
+            var_type = p.ParseTypeString()
+        }
+        var init_node *Node = (*Node)(uintptr(0))
+        if p.Peek() == TOK_ASSIGN {
+            p.Advance()
+            init_node = p.ParseExpr()
+        }
+
+        node_kind := NODE_GLOBAL_VAR
+        if is_const {
+            node_kind = NODE_CONST
+        }
+        var_node := AllocNode(p.arena, node_kind, tok.line, tok.col)
+        var_node.name = var_name
+        var_node.type_str = var_type
+        var_node.init = init_node
+        return var_node
+    }
+
+    // Skip unknown token
+    p.Advance()
+    return (*Node)(uintptr(0))
+}
+
+func (p *Parser) ParseBlock() *Node {
+    p.Consume(TOK_LBRACE)
+    block := AllocNode(p.arena, NODE_BLOCK, p.cur_tok.line, p.cur_tok.col)
+    var last_stmt *Node = (*Node)(uintptr(0))
+
+    for p.Peek() != TOK_RBRACE && p.Peek() != TOK_EOF {
+        p.SkipSemicolons()
+        if p.Peek() == TOK_RBRACE {
+            break
+        }
+        stmt := p.ParseStmt()
+        if uintptr(stmt) != 0 {
+            if uintptr(last_stmt) == 0 {
+                block.body = stmt
+            } else {
+                last_stmt.next = stmt
+            }
+            last_stmt = stmt
+        }
+        p.SkipSemicolons()
+    }
+    p.Consume(TOK_RBRACE)
+    return block
+}
+
+func (p *Parser) ParseStmt() *Node {
+    p.SkipSemicolons()
+    tok := p.cur_tok
+
+    if tok.kind == TOK_RETURN {
+        p.Advance()
+        ret_node := AllocNode(p.arena, NODE_RETURN, tok.line, tok.col)
+        if p.Peek() != TOK_SEMICOLON && p.Peek() != TOK_RBRACE {
+            ret_node.left = p.ParseExpr()
+        }
+        return ret_node
+    }
+
+    if tok.kind == TOK_DEFER {
+        p.Advance()
+        defer_node := AllocNode(p.arena, NODE_DEFER, tok.line, tok.col)
+        defer_node.left = p.ParseExpr()
+        return defer_node
+    }
+
+    if tok.kind == TOK_VAR {
+        p.Advance()
+        v_name := p.Advance().str_val
+        var v_type *i8 = (*i8)(uintptr(0))
+        if p.Peek() == TOK_IDENT || p.Peek() == TOK_STAR {
+            v_type = p.ParseTypeString()
+        }
+        var init_expr *Node = (*Node)(uintptr(0))
+        if p.Peek() == TOK_ASSIGN {
+            p.Advance()
+            init_expr = p.ParseExpr()
+        }
+        decl := AllocNode(p.arena, NODE_VAR_DECL, tok.line, tok.col)
+        decl.name = v_name
+        decl.type_str = v_type
+        decl.init = init_expr
+        return decl
+    }
+
+    if tok.kind == TOK_IF {
+        p.Advance()
+        if_node := AllocNode(p.arena, NODE_IF, tok.line, tok.col)
+        if_node.cond = p.ParseExpr()
+        if_node.body = p.ParseBlock()
+        if p.Peek() == TOK_ELSE {
+            p.Advance()
+            if p.Peek() == TOK_IF {
+                if_node.right = p.ParseStmt()
+            } else {
+                if_node.right = p.ParseBlock()
+            }
+        }
+        return if_node
+    }
+
+    if tok.kind == TOK_FOR {
+        p.Advance()
+        for_node := AllocNode(p.arena, NODE_FOR, tok.line, tok.col)
+        if p.Peek() == TOK_LBRACE {
+            for_node.body = p.ParseBlock()
+            return for_node
+        }
+        // Three clause or condition
+        first := p.ParseStmt()
+        if p.Peek() == TOK_SEMICOLON {
+            p.Advance()
+            for_node.init = first
+            if p.Peek() != TOK_SEMICOLON {
+                for_node.cond = p.ParseExpr()
+            }
+            p.Consume(TOK_SEMICOLON)
+            if p.Peek() != TOK_LBRACE {
+                for_node.post = p.ParseStmt()
+            }
+        } else {
+            for_node.cond = first
+        }
+        for_node.body = p.ParseBlock()
+        return for_node
+    }
+
+    // Assignment, Short var decl, or Expression
+    expr := p.ParseExpr()
+
+    if p.Peek() == TOK_COLON_ASSIGN {
+        op_tok := p.Advance()
+        val_expr := p.ParseExpr()
+        decl := AllocNode(p.arena, NODE_VAR_DECL, op_tok.line, op_tok.col)
+        decl.name = expr.name
+        decl.init = val_expr
+        return decl
+    }
+
+    if p.Peek() == TOK_ASSIGN || p.Peek() == TOK_PLUS_ASSIGN || p.Peek() == TOK_MINUS_ASSIGN {
+        op_tok := p.Advance()
+        val_expr := p.ParseExpr()
+        assign_node := AllocNode(p.arena, NODE_ASSIGN, op_tok.line, op_tok.col)
+        assign_node.left = expr
+        assign_node.right = val_expr
+        assign_node.op = op_tok.kind
+        return assign_node
+    }
+
+    expr_stmt := AllocNode(p.arena, NODE_EXPR_STMT, tok.line, tok.col)
+    expr_stmt.left = expr
+    return expr_stmt
+}
+
+func (p *Parser) ParseExpr() *Node {
+    return p.ParseBinary(0)
+}
+
+func GetPrecedence(op int) int {
+    if op == TOK_OR { return 1 }
+    if op == TOK_AND { return 2 }
+    if op >= TOK_EQ && op <= TOK_GT_EQ { return 3 }
+    if op == TOK_PIPE { return 4 }
+    if op == TOK_CARET { return 5 }
+    if op == TOK_AMP { return 6 }
+    if op == TOK_SHL || op == TOK_SHR { return 7 }
+    if op == TOK_PLUS || op == TOK_MINUS { return 8 }
+    if op == TOK_STAR || op == TOK_SLASH || op == TOK_PERCENT { return 9 }
+    return 0
+}
+
+func (p *Parser) ParseBinary(min_prec int) *Node {
+    lhs := p.ParseUnary()
+
+    for {
+        op := p.Peek()
+        prec := GetPrecedence(op)
+        if prec == 0 || prec < min_prec {
+            break
+        }
+
+        op_tok := p.Advance()
+        rhs := p.ParseBinary(prec + 1)
+
+        bin_node := AllocNode(p.arena, NODE_BINARY, op_tok.line, op_tok.col)
+        bin_node.op = op
+        bin_node.left = lhs
+        bin_node.right = rhs
+        lhs = bin_node
+    }
+
+    return lhs
+}
+
+func (p *Parser) ParseUnary() *Node {
+    tok := p.cur_tok
+    if tok.kind == TOK_MINUS || tok.kind == TOK_BANG || tok.kind == TOK_STAR || tok.kind == TOK_AMP {
+        op_tok := p.Advance()
+        inner := p.ParseUnary()
+        unary_node := AllocNode(p.arena, NODE_UNARY, op_tok.line, op_tok.col)
+        unary_node.op = op_tok.kind
+        unary_node.left = inner
+        return unary_node
+    }
+    return p.ParsePrimary()
+}
+
+func (p *Parser) ParsePrimary() *Node {
+    tok := p.Advance()
+
+    var expr *Node = (*Node)(uintptr(0))
+
+    if tok.kind == TOK_INT {
+        expr = AllocNode(p.arena, NODE_INT_LIT, tok.line, tok.col)
+        expr.int_val = tok.int_val
+    } else if tok.kind == TOK_STRING {
+        expr = AllocNode(p.arena, NODE_STR_LIT, tok.line, tok.col)
+        expr.str_val = tok.str_val
+    } else if tok.kind == TOK_IDENT {
+        expr = AllocNode(p.arena, NODE_IDENT, tok.line, tok.col)
+        expr.name = tok.str_val
+    } else if tok.kind == TOK_INLINE_ASM {
+        p.Consume(TOK_LPAREN)
+        asm_str := p.Advance().str_val
+        p.Consume(TOK_RPAREN)
+        expr = AllocNode(p.arena, NODE_INLINE_ASM, tok.line, tok.col)
+        expr.str_val = asm_str
+    } else if tok.kind == TOK_LPAREN {
+        expr = p.ParseExpr()
+        p.Consume(TOK_RPAREN)
+    } else {
+        expr = AllocNode(p.arena, NODE_INT_LIT, tok.line, tok.col)
+    }
+
+    // Postfix: function calls, member accesses, indices
+    for {
+        if p.Peek() == TOK_LPAREN {
+            p.Advance()
+            call_node := AllocNode(p.arena, NODE_CALL, tok.line, tok.col)
+            call_node.left = expr
+            var last_arg *Node = (*Node)(uintptr(0))
+            for p.Peek() != TOK_RPAREN && p.Peek() != TOK_EOF {
+                arg := p.ParseExpr()
+                if uintptr(last_arg) == 0 {
+                    call_node.args = arg
+                } else {
+                    last_arg.next = arg
+                }
+                last_arg = arg
+                if p.Peek() == TOK_COMMA {
+                    p.Advance()
+                }
+            }
+            p.Consume(TOK_RPAREN)
+            expr = call_node
+        } else if p.Peek() == TOK_DOT {
+            p.Advance()
+            field_name := p.Advance().str_val
+            mem_node := AllocNode(p.arena, NODE_MEMBER, tok.line, tok.col)
+            mem_node.left = expr
+            mem_node.name = field_name
+            expr = mem_node
+        } else if p.Peek() == TOK_LBRACKET {
+            p.Advance()
+            idx_expr := p.ParseExpr()
+            p.Consume(TOK_RBRACKET)
+            idx_node := AllocNode(p.arena, NODE_INDEX, tok.line, tok.col)
+            idx_node.left = expr
+            idx_node.right = idx_expr
+            expr = idx_node
+        } else {
+            break
+        }
+    }
+
+    return expr
+}

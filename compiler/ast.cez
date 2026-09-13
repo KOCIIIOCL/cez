@@ -1,0 +1,77 @@
+package main
+
+// AST Node Kind Constants for self-hosted Cez compiler
+
+const NODE_PROGRAM       int = 100
+const NODE_PACKAGE       int = 101
+const NODE_IMPORT        int = 102
+const NODE_FUNC          int = 103
+const NODE_STRUCT_DEF    int = 104
+const NODE_GLOBAL_VAR    int = 105
+const NODE_CONST         int = 106
+
+const NODE_BLOCK         int = 120
+const NODE_VAR_DECL      int = 121
+const NODE_ASSIGN        int = 122
+const NODE_RETURN        int = 123
+const NODE_DEFER         int = 124
+const NODE_IF            int = 125
+const NODE_FOR           int = 126
+const NODE_EXPR_STMT     int = 127
+
+const NODE_BINARY        int = 140
+const NODE_UNARY         int = 141
+const NODE_CALL          int = 142
+const NODE_MEMBER        int = 143
+const NODE_INDEX         int = 144
+const NODE_CAST          int = 145
+const NODE_INT_LIT       int = 146
+const NODE_STR_LIT       int = 147
+const NODE_IDENT         int = 148
+const NODE_INLINE_ASM    int = 149
+const NODE_VOLATILE_LOAD int = 150
+const NODE_VOLATILE_STORE int = 151
+
+// AST Node representation in Cez
+type Node struct {
+    kind     int
+    line     int
+    col      int
+    name     *i8
+    int_val  int
+    str_val  *i8
+    type_str *i8
+    is_ptr   bool
+    op       int
+    left     *Node
+    right    *Node
+    cond     *Node
+    init     *Node
+    post     *Node
+    body     *Node
+    next     *Node
+    args     *Node
+}
+
+func AllocNode(arena *Arena, kind int, line int, col int) *Node {
+    ptr := arena.Alloc(256) // sizeof(Node) is 136 bytes, allocate 256 with margin
+    node := (*Node)(uintptr(ptr))
+    node.kind = kind
+    node.line = line
+    node.col = col
+    node.name = (*i8)(uintptr(0))
+    node.int_val = 0
+    node.str_val = (*i8)(uintptr(0))
+    node.type_str = (*i8)(uintptr(0))
+    node.is_ptr = false
+    node.op = 0
+    node.left = (*Node)(uintptr(0))
+    node.right = (*Node)(uintptr(0))
+    node.cond = (*Node)(uintptr(0))
+    node.init = (*Node)(uintptr(0))
+    node.post = (*Node)(uintptr(0))
+    node.body = (*Node)(uintptr(0))
+    node.next = (*Node)(uintptr(0))
+    node.args = (*Node)(uintptr(0))
+    return node
+}

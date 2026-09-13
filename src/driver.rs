@@ -8,7 +8,7 @@ use std::process::Command;
 
 #[derive(Debug, Clone)]
 pub struct CompilerOptions {
-    pub input_file: PathBuf,
+    pub input_files: Vec<PathBuf>,
     pub output_file: Option<PathBuf>,
     pub opt_level: String, // "0", "1", "2", "3", "s", "z"
     pub is_freestanding: bool,
@@ -20,7 +20,7 @@ pub struct CompilerOptions {
 impl Default for CompilerOptions {
     fn default() -> Self {
         Self {
-            input_file: PathBuf::new(),
+            input_files: Vec::new(),
             output_file: None,
             opt_level: "2".to_string(),
             is_freestanding: false,
@@ -34,14 +34,40 @@ impl Default for CompilerOptions {
 pub struct Driver;
 
 impl Driver {
-    pub fn compile_to_llvm_ir(source: &str, target_triple: &str, is_freestanding: bool) -> Result<String, String> {
-        // 1. Lexer
-        let mut lexer = Lexer::new(source);
-        let tokens = lexer.tokenize_all()?;
+    pub fn compile_files_to_llvm_ir(
+        files: &[PathBuf],
+        target_triple: &str,
+        is_freestanding: bool,
+    ) -> Result<String, String> {
+        if files.is_empty() {
+            return Err("No input files provided".to_string());
+        }
 
-        // 2. Parser
-        let mut parser = Parser::new(tokens);
-        let program = parser.parse_program()?;
+        let mut merged_program: Option<crate::ast::Program> = None;
+
+        for file in files {
+            let source = fs::read_to_string(file)
+                .map_err(|e| format!("Failed to read file '{}': {}", file.display(), e))?;
+
+            let mut lexer = Lexer::new(&source);
+            let tokens = lexer.tokenize_all()?;
+
+            let mut parser = Parser::new(tokens);
+            let program = parser.parse_program()?;
+
+            if let Some(ref mut merged) = merged_program {
+                merged.decls.extend(program.decls);
+                for imp in program.imports {
+                    if !merged.imports.contains(&imp) {
+                        merged.imports.push(imp);
+                    }
+                }
+            } else {
+                merged_program = Some(program);
+            }
+        }
+
+        let program = merged_program.unwrap();
 
         // 3. Sema
         let mut sema = Sema::new();
@@ -55,8 +81,9 @@ impl Driver {
     }
 
     pub fn build(options: CompilerOptions) -> Result<PathBuf, String> {
-        let source = fs::read_to_string(&options.input_file)
-            .map_err(|e| format!("Failed to read file '{}': {}", options.input_file.display(), e))?;
+        if options.input_files.is_empty() {
+            return Err("No input files provided".to_string());
+        }
 
         let target_triple = options.target.clone().unwrap_or_else(|| {
             if options.is_freestanding {
@@ -66,12 +93,18 @@ impl Driver {
             }
         });
 
-        let llvm_ir = Self::compile_to_llvm_ir(&source, &target_triple, options.is_freestanding)?;
+        let llvm_ir = Self::compile_files_to_llvm_ir(
+            &options.input_files,
+            &target_triple,
+            options.is_freestanding,
+        )?;
+
+        let primary_file = &options.input_files[0];
 
         // If user just requested LLVM IR output
         if options.emit_llvm {
             let out_path = options.output_file.clone().unwrap_or_else(|| {
-                options.input_file.with_extension("ll")
+                primary_file.with_extension("ll")
             });
             fs::write(&out_path, &llvm_ir)
                 .map_err(|e| format!("Failed to write LLVM IR to '{}': {}", out_path.display(), e))?;
@@ -79,14 +112,14 @@ impl Driver {
         }
 
         // Write temporary .ll file
-        let stem = options.input_file.file_stem().unwrap().to_str().unwrap();
+        let stem = primary_file.file_stem().unwrap().to_str().unwrap();
         let temp_ll_path = std::env::temp_dir().join(format!("cez_{}_{}.ll", stem, std::process::id()));
         fs::write(&temp_ll_path, &llvm_ir)
             .map_err(|e| format!("Failed to write temporary LLVM IR to '{}': {}", temp_ll_path.display(), e))?;
 
         let final_output = options.output_file.clone().unwrap_or_else(|| {
             if options.emit_obj {
-                options.input_file.with_extension("o")
+                primary_file.with_extension("o")
             } else {
                 PathBuf::from(stem)
             }

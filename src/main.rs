@@ -70,37 +70,18 @@ fn main() {
         }
         "check" => {
             if args.len() < 3 {
-                eprintln!("Error: 'cez check' requires an input file.");
+                eprintln!("Error: 'cez check' requires at least one input file.");
                 process::exit(1);
             }
-            let input_path = PathBuf::from(&args[2]);
-            let source = match std::fs::read_to_string(&input_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Error reading '{}': {}", input_path.display(), e);
-                    process::exit(1);
+            let mut files = Vec::new();
+            for arg in &args[2..] {
+                if !arg.starts_with('-') {
+                    files.push(PathBuf::from(arg));
                 }
-            };
-            let mut lexer = lexer::Lexer::new(&source);
-            let tokens = match lexer.tokenize_all() {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("Lexer error: {}", e);
-                    process::exit(1);
-                }
-            };
-            let mut parser = parser::Parser::new(tokens);
-            let program = match parser.parse_program() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("Parser error: {}", e);
-                    process::exit(1);
-                }
-            };
-            let mut sema = sema::Sema::new();
-            match sema.analyze_program(program) {
+            }
+            match Driver::compile_files_to_llvm_ir(&files, "x86_64-unknown-linux-gnu", false) {
                 Ok(_) => {
-                    println!("Check passed: {} is valid Cez code.", input_path.display());
+                    println!("Check passed: all {} files are valid Cez code.", files.len());
                 }
                 Err(e) => {
                     eprintln!("Semantic error: {}", e);
@@ -114,10 +95,9 @@ fn main() {
                 process::exit(1);
             }
             let mut options = CompilerOptions::default();
-            options.input_file = PathBuf::from(&args[2]);
             options.emit_llvm = true;
 
-            let mut i = 3;
+            let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
                     "-o" => {
@@ -129,6 +109,9 @@ fn main() {
                     "--freestanding" => options.is_freestanding = true,
                     s if s.starts_with("--target=") => {
                         options.target = Some(s.trim_start_matches("--target=").to_string());
+                    }
+                    arg if !arg.starts_with('-') => {
+                        options.input_files.push(PathBuf::from(arg));
                     }
                     _ => {}
                 }
@@ -149,9 +132,8 @@ fn main() {
                 process::exit(1);
             }
             let mut options = CompilerOptions::default();
-            options.input_file = PathBuf::from(&args[2]);
 
-            let mut i = 3;
+            let mut i = 2;
             while i < args.len() {
                 match args[i].as_str() {
                     "-o" => {
@@ -169,6 +151,9 @@ fn main() {
                     "--emit-obj" => options.emit_obj = true,
                     s if s.starts_with("--target=") => {
                         options.target = Some(s.trim_start_matches("--target=").to_string());
+                    }
+                    arg if !arg.starts_with('-') => {
+                        options.input_files.push(PathBuf::from(arg));
                     }
                     _ => {}
                 }
@@ -189,24 +174,34 @@ fn main() {
                 process::exit(1);
             }
             let mut options = CompilerOptions::default();
-            options.input_file = PathBuf::from(&args[2]);
-
             let mut run_args = Vec::new();
-            let mut i = 3;
+
+            let mut i = 2;
+            let mut passed_double_dash = false;
             while i < args.len() {
-                if args[i] == "--" {
-                    run_args.extend_from_slice(&args[i + 1..]);
-                    break;
+                if passed_double_dash {
+                    run_args.push(args[i].clone());
+                } else if args[i] == "--" {
+                    passed_double_dash = true;
                 } else if args[i] == "--freestanding" {
                     options.is_freestanding = true;
+                } else if !args[i].starts_with('-') && options.input_files.is_empty() {
+                    options.input_files.push(PathBuf::from(&args[i]));
+                } else if !options.input_files.is_empty() && !args[i].starts_with('-') && args[i].ends_with(".cez") {
+                    options.input_files.push(PathBuf::from(&args[i]));
                 } else {
                     run_args.push(args[i].clone());
                 }
                 i += 1;
             }
 
+            if options.input_files.is_empty() {
+                eprintln!("Error: 'cez run' requires at least one input file.");
+                process::exit(1);
+            }
+
             // Create temporary binary for execution
-            let stem = options.input_file.file_stem().unwrap().to_str().unwrap();
+            let stem = options.input_files[0].file_stem().unwrap().to_str().unwrap();
             let temp_bin = std::env::temp_dir().join(format!("cez_run_{}_{}", stem, process::id()));
             options.output_file = Some(temp_bin.clone());
 

@@ -3,3 +3,4 @@
 *.ll
 *.elf
 *.bin
+bin/

@@ -1,0 +1,326 @@
+package main
+
+// Self-hosted Lexer for Cez
+
+type Lexer struct {
+    src       *u8
+    len       usize
+    pos       usize
+    line      int
+    col       int
+    prev_kind int
+    arena     *Arena
+}
+
+func (l *Lexer) Init(src *u8, len usize, arena *Arena) {
+    l.src = src
+    l.len = len
+    l.pos = 0
+    l.line = 1
+    l.col = 1
+    l.prev_kind = TOK_EOF
+    l.arena = arena
+}
+
+func (l *Lexer) Peek() u8 {
+    if l.pos < l.len {
+        return *((*u8)(uintptr(l.src) + l.pos))
+    }
+    return u8(0)
+}
+
+func (l *Lexer) PeekNext() u8 {
+    if l.pos + 1 < l.len {
+        return *((*u8)(uintptr(l.src) + l.pos + 1))
+    }
+    return u8(0)
+}
+
+func (l *Lexer) Advance() u8 {
+    if l.pos < l.len {
+        ch := *((*u8)(uintptr(l.src) + l.pos))
+        l.pos += 1
+        if ch == u8(10) { // '\n'
+            l.line += 1
+            l.col = 1
+        } else {
+            l.col += 1
+        }
+        return ch
+    }
+    return u8(0)
+}
+
+func CanPrecedeSemicolon(k int) bool {
+    if k == TOK_IDENT || k == TOK_INT || k == TOK_STRING || k == TOK_CHAR {
+        return true
+    }
+    if k == TOK_RETURN || k == TOK_BREAK || k == TOK_CONTINUE {
+        return true
+    }
+    if k == TOK_RPAREN || k == TOK_RBRACKET || k == TOK_RBRACE {
+        return true
+    }
+    return false
+}
+
+func (l *Lexer) NextToken() Token {
+    for {
+        if l.pos >= l.len {
+            if CanPrecedeSemicolon(l.prev_kind) {
+                l.prev_kind = TOK_SEMICOLON
+                return Token{ kind: TOK_SEMICOLON, line: l.line, col: l.col, int_val: 0, str_val: (*i8)(uintptr(0)) }
+            }
+            return Token{ kind: TOK_EOF, line: l.line, col: l.col, int_val: 0, str_val: (*i8)(uintptr(0)) }
+        }
+
+        ch := l.Peek()
+        cur_line := l.line
+        cur_col := l.col
+
+        // Whitespace (spaces, tabs, carriage return)
+        if ch == u8(32) || ch == u8(9) || ch == u8(13) {
+            l.Advance()
+            continue
+        }
+
+        // Newline: Automatic Semicolon Insertion (ASI)
+        if ch == u8(10) {
+            l.Advance()
+            if CanPrecedeSemicolon(l.prev_kind) {
+                l.prev_kind = TOK_SEMICOLON
+                return Token{ kind: TOK_SEMICOLON, line: cur_line, col: cur_col, int_val: 0, str_val: (*i8)(uintptr(0)) }
+            }
+            continue
+        }
+
+        // Comments
+        if ch == u8(47) { // '/'
+            next := l.PeekNext()
+            if next == u8(47) { // "//"
+                l.Advance()
+                l.Advance()
+                for l.Peek() != u8(10) && l.Peek() != u8(0) {
+                    l.Advance()
+                }
+                continue
+            }
+        }
+
+        // String literals
+        if ch == u8(34) { // '"'
+            l.Advance()
+            start_pos := l.pos
+            for l.Peek() != u8(34) && l.Peek() != u8(0) {
+                if l.Peek() == u8(92) { // '\\'
+                    l.Advance()
+                }
+                l.Advance()
+            }
+            str_len := l.pos - start_pos
+            l.Advance() // skip closing quote
+
+            // Allocate string in arena
+            s_buf := l.arena.Alloc(str_len + 1)
+            memcpy(s_buf, (*u8)(uintptr(l.src) + start_pos), str_len)
+            *((*u8)(uintptr(s_buf) + str_len)) = u8(0)
+
+            tok := Token{ kind: TOK_STRING, line: cur_line, col: cur_col, int_val: int(str_len), str_val: (*i8)(uintptr(s_buf)) }
+            l.prev_kind = tok.kind
+            return tok
+        }
+
+        // Numbers
+        if ch >= u8(48) && ch <= u8(57) { // '0'..'9'
+            var val int = 0
+            if ch == u8(48) && (l.PeekNext() == u8(120) || l.PeekNext() == u8(88)) { // 0x
+                l.Advance()
+                l.Advance()
+                for {
+                    c := l.Peek()
+                    if c >= u8(48) && c <= u8(57) {
+                        val = val * 16 + int(c - u8(48))
+                        l.Advance()
+                    } else if c >= u8(97) && c <= u8(102) { // 'a'..'f'
+                        val = val * 16 + int(c - u8(97) + 10)
+                        l.Advance()
+                    } else if c >= u8(65) && c <= u8(70) { // 'A'..'F'
+                        val = val * 16 + int(c - u8(65) + 10)
+                        l.Advance()
+                    } else if c == u8(95) { // '_'
+                        l.Advance()
+                    } else {
+                        break
+                    }
+                }
+            } else {
+                for {
+                    c := l.Peek()
+                    if c >= u8(48) && c <= u8(57) {
+                        val = val * 10 + int(c - u8(48))
+                        l.Advance()
+                    } else if c == u8(95) {
+                        l.Advance()
+                    } else {
+                        break
+                    }
+                }
+            }
+            tok := Token{ kind: TOK_INT, line: cur_line, col: cur_col, int_val: val, str_val: (*i8)(uintptr(0)) }
+            l.prev_kind = tok.kind
+            return tok
+        }
+
+        // Attributes starting with '@'
+        if ch == u8(64) { // '@'
+            l.Advance()
+            start_pos := l.pos
+            for {
+                c := l.Peek()
+                if (c >= u8(97) && c <= u8(122)) || (c >= u8(65) && c <= u8(90)) || c == u8(95) {
+                    l.Advance()
+                } else {
+                    break
+                }
+            }
+            attr_len := l.pos - start_pos
+            s_buf := l.arena.Alloc(attr_len + 1)
+            memcpy(s_buf, (*u8)(uintptr(l.src) + start_pos), attr_len)
+            *((*u8)(uintptr(s_buf) + attr_len)) = u8(0)
+
+            var k int = TOK_IDENT
+            if StrEq((*i8)(uintptr(s_buf)), "packed") {
+                k = TOK_AT_PACKED
+            } else if StrEq((*i8)(uintptr(s_buf)), "naked") {
+                k = TOK_AT_NAKED
+            } else if StrEq((*i8)(uintptr(s_buf)), "align") {
+                k = TOK_AT_ALIGN
+            } else if StrEq((*i8)(uintptr(s_buf)), "section") {
+                k = TOK_AT_SECTION
+            } else if StrEq((*i8)(uintptr(s_buf)), "export") {
+                k = TOK_AT_EXPORT
+            }
+
+            tok := Token{ kind: k, line: cur_line, col: cur_col, int_val: 0, str_val: (*i8)(uintptr(s_buf)) }
+            l.prev_kind = tok.kind
+            return tok
+        }
+
+        // Identifiers and Keywords
+        if (ch >= u8(97) && ch <= u8(122)) || (ch >= u8(65) && ch <= u8(90)) || ch == u8(95) {
+            start_pos := l.pos
+            for {
+                c := l.Peek()
+                if (c >= u8(97) && c <= u8(122)) || (c >= u8(65) && c <= u8(90)) || (c >= u8(48) && c <= u8(57)) || c == u8(95) {
+                    l.Advance()
+                } else {
+                    break
+                }
+            }
+            id_len := l.pos - start_pos
+            s_buf := l.arena.Alloc(id_len + 1)
+            memcpy(s_buf, (*u8)(uintptr(l.src) + start_pos), id_len)
+            *((*u8)(uintptr(s_buf) + id_len)) = u8(0)
+            id_str := (*i8)(uintptr(s_buf))
+
+            var k int = TOK_IDENT
+            if StrEq(id_str, "package") {
+                k = TOK_PACKAGE
+            } else if StrEq(id_str, "import") {
+                k = TOK_IMPORT
+            } else if StrEq(id_str, "func") || StrEq(id_str, "fn") {
+                k = TOK_FUNC
+            } else if StrEq(id_str, "type") {
+                k = TOK_TYPE
+            } else if StrEq(id_str, "struct") {
+                k = TOK_STRUCT
+            } else if StrEq(id_str, "var") {
+                k = TOK_VAR
+            } else if StrEq(id_str, "const") {
+                k = TOK_CONST
+            } else if StrEq(id_str, "if") {
+                k = TOK_IF
+            } else if StrEq(id_str, "else") {
+                k = TOK_ELSE
+            } else if StrEq(id_str, "for") {
+                k = TOK_FOR
+            } else if StrEq(id_str, "return") {
+                k = TOK_RETURN
+            } else if StrEq(id_str, "defer") {
+                k = TOK_DEFER
+            } else if StrEq(id_str, "break") {
+                k = TOK_BREAK
+            } else if StrEq(id_str, "continue") {
+                k = TOK_CONTINUE
+            } else if StrEq(id_str, "extern") {
+                k = TOK_EXTERN
+            } else if StrEq(id_str, "inline_asm") {
+                k = TOK_INLINE_ASM
+            }
+
+            tok := Token{ kind: k, line: cur_line, col: cur_col, int_val: 0, str_val: id_str }
+            l.prev_kind = tok.kind
+            return tok
+        }
+
+        // Single-character and double-character operators
+        l.Advance()
+        var kind int = 0
+
+        if ch == u8(43) { // '+'
+            if l.Peek() == u8(61) { l.Advance(); kind = TOK_PLUS_ASSIGN } else { kind = TOK_PLUS }
+        } else if ch == u8(45) { // '-'
+            if l.Peek() == u8(61) { l.Advance(); kind = TOK_MINUS_ASSIGN } else { kind = TOK_MINUS }
+        } else if ch == u8(42) { // '*'
+            kind = TOK_STAR
+        } else if ch == u8(47) { // '/'
+            kind = TOK_SLASH
+        } else if ch == u8(37) { // '%'
+            kind = TOK_PERCENT
+        } else if ch == u8(61) { // '='
+            if l.Peek() == u8(61) { l.Advance(); kind = TOK_EQ } else { kind = TOK_ASSIGN }
+        } else if ch == u8(33) { // '!'
+            if l.Peek() == u8(61) { l.Advance(); kind = TOK_NOT_EQ } else { kind = TOK_BANG }
+        } else if ch == u8(60) { // '<'
+            if l.Peek() == u8(61) { l.Advance(); kind = TOK_LT_EQ } else if l.Peek() == u8(60) { l.Advance(); kind = TOK_SHL } else { kind = TOK_LT }
+        } else if ch == u8(62) { // '>'
+            if l.Peek() == u8(61) { l.Advance(); kind = TOK_GT_EQ } else if l.Peek() == u8(62) { l.Advance(); kind = TOK_SHR } else { kind = TOK_GT }
+        } else if ch == u8(38) { // '&'
+            if l.Peek() == u8(38) { l.Advance(); kind = TOK_AND } else { kind = TOK_AMP }
+        } else if ch == u8(124) { // '|'
+            if l.Peek() == u8(124) { l.Advance(); kind = TOK_OR } else { kind = TOK_PIPE }
+        } else if ch == u8(94) { // '^'
+            kind = TOK_CARET
+        } else if ch == u8(58) { // ':'
+            if l.Peek() == u8(61) { l.Advance(); kind = TOK_COLON_ASSIGN } else { kind = TOK_COLON }
+        } else if ch == u8(46) { // '.'
+            if l.Peek() == u8(46) && l.PeekNext() == u8(46) {
+                l.Advance()
+                l.Advance()
+                kind = TOK_ELLIPSIS
+            } else {
+                kind = TOK_DOT
+            }
+        } else if ch == u8(59) { // ';'
+            kind = TOK_SEMICOLON
+        } else if ch == u8(44) { // ','
+            kind = TOK_COMMA
+        } else if ch == u8(40) { // '('
+            kind = TOK_LPAREN
+        } else if ch == u8(41) { // ')'
+            kind = TOK_RPAREN
+        } else if ch == u8(91) { // '['
+            kind = TOK_LBRACKET
+        } else if ch == u8(93) { // ']'
+            kind = TOK_RBRACKET
+        } else if ch == u8(123) { // '{'
+            kind = TOK_LBRACE
+        } else if ch == u8(125) { // '}'
+            kind = TOK_RBRACE
+        }
+
+        tok := Token{ kind: kind, line: cur_line, col: cur_col, int_val: 0, str_val: (*i8)(uintptr(0)) }
+        l.prev_kind = tok.kind
+        return tok
+    }
+}

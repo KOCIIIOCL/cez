@@ -12,6 +12,7 @@ pub struct LlvmCodegen {
     string_literals: Vec<(String, usize)>, // (content, global_id)
     locals: HashMap<String, (String, Type)>, // var_name -> (llvm_reg, Type)
     defer_stack: Vec<TypedStmt>,
+    loop_stack: Vec<(String, String)>, // (post_label, exit_label)
     current_block_terminated: bool,
 }
 
@@ -26,6 +27,7 @@ impl LlvmCodegen {
             string_literals: Vec::new(),
             locals: HashMap::new(),
             defer_stack: Vec::new(),
+            loop_stack: Vec::new(),
             current_block_terminated: false,
         }
     }
@@ -179,6 +181,7 @@ impl LlvmCodegen {
         self.reg_counter = 1;
         self.locals.clear();
         self.defer_stack.clear();
+        self.loop_stack.clear();
         self.current_block_terminated = false;
 
         let ret_ty_str = f.ret_type.to_llvm_type();
@@ -502,9 +505,11 @@ impl LlvmCodegen {
                 // Loop Body
                 self.emit_line(&format!("{}:", body_label));
                 self.current_block_terminated = false;
+                self.loop_stack.push((post_label.clone(), exit_label.clone()));
                 for s in body {
                     self.generate_stmt(s, ret_ty);
                 }
+                self.loop_stack.pop();
                 if !self.current_block_terminated {
                     self.emit_instruction(&format!("br label %{}", post_label));
                 }
@@ -530,10 +535,18 @@ impl LlvmCodegen {
                 }
             }
             TypedStmt::Break(..) => {
-                // Break will branch to loop exit
+                if let Some((_, exit_lbl)) = self.loop_stack.last() {
+                    let exit_lbl = exit_lbl.clone();
+                    self.emit_instruction(&format!("br label %{}", exit_lbl));
+                    self.current_block_terminated = true;
+                }
             }
             TypedStmt::Continue(..) => {
-                // Continue will branch to loop post
+                if let Some((post_lbl, _)) = self.loop_stack.last() {
+                    let post_lbl = post_lbl.clone();
+                    self.emit_instruction(&format!("br label %{}", post_lbl));
+                    self.current_block_terminated = true;
+                }
             }
         }
     }

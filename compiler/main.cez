@@ -1,0 +1,75 @@
+package main
+
+extern func printf(fmt *i8, ...) i32
+extern func puts(s *i8) i32
+
+func main(argc int, argv **i8) int {
+    puts("=== Cez Self-Hosted Compiler (Stage 1) ===")
+
+    if argc < 2 {
+        puts("Usage: cez-stage1 <source.cez> [-o <output>]")
+        return 1
+    }
+
+    input_path := *(**i8)(uintptr(argv) + 8) // argv[1]
+    var output_bin *i8 = "a.out"
+
+    if argc >= 4 {
+        flag := *(**i8)(uintptr(argv) + 16) // argv[2]
+        if StrEq(flag, "-o") {
+            output_bin = *(**i8)(uintptr(argv) + 24) // argv[3]
+        }
+    }
+
+    printf("[Cez] Reading input file: %s\n", input_path)
+    file := ReadFile(input_path)
+    if uintptr(file.data) == 0 {
+        printf("[Cez Error] Could not read file '%s'\n", input_path)
+        return 1
+    }
+
+    printf("[Cez] File loaded successfully (%lu bytes)\n", file.size)
+
+    // Allocate 16MB Arena for compilation
+    arena_buf := malloc(16 * 1024 * 1024)
+    var arena Arena
+    arena.Init(arena_buf, 16 * 1024 * 1024)
+    defer free(arena_buf)
+
+    // Parse
+    printf("[Cez] Parsing source AST...\n")
+    var parser Parser
+    parser.Init(file.data, file.size, &arena)
+    root := parser.ParseProgram()
+
+    // Codegen to /tmp/stage1_out.ll
+    temp_ll := "/tmp/stage1_out.ll"
+    mode := "w"
+    fp := fopen(temp_ll, mode)
+    if uintptr(fp) == 0 {
+        puts("[Cez Error] Could not open temporary LLVM IR file")
+        return 1
+    }
+
+    printf("[Cez] Generating LLVM IR...\n")
+    var codegen Codegen
+    codegen.Init(fp)
+    codegen.Generate(root)
+    fclose(fp)
+
+    // Invoke Clang
+    cmd_buf := malloc(512)
+    sprintf(cmd_buf, "clang -O2 %s -o %s", temp_ll, output_bin)
+    printf("[Cez] Invoking backend linker: %s\n", (*i8)(uintptr(cmd_buf)))
+    ret := Exec((*i8)(uintptr(cmd_buf)))
+    free(cmd_buf)
+
+    if ret == 0 {
+        printf("[Cez Success] Successfully built '%s' via self-hosted compiler!\n", output_bin)
+    } else {
+        printf("[Cez Error] Backend linking failed with code %d\n", ret)
+        return 1
+    }
+
+    return 0
+}

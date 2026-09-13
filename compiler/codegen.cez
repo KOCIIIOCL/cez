@@ -1,0 +1,260 @@
+package main
+
+// Self-hosted LLVM IR Code Generator for Cez
+
+extern func fputs(s *i8, stream *i8) i32
+extern func fprintf(stream *i8, format *i8, ...) i32
+
+type Codegen struct {
+    out_fp            *i8
+    reg_id            int
+    lbl_id            int
+    defer_count       int
+    defers            [32]*Node
+    str_count         int
+    strings           [128]*i8
+    current_func_name *i8
+    func_returned     bool
+}
+
+func (c *Codegen) Init(out_fp *i8) {
+    c.out_fp = out_fp
+    c.reg_id = 1
+    c.lbl_id = 1
+    c.defer_count = 0
+    c.str_count = 0
+    c.func_returned = false
+}
+
+func (c *Codegen) NewReg() int {
+    r := c.reg_id
+    c.reg_id += 1
+    return r
+}
+
+func (c *Codegen) NewLabel() int {
+    l := c.lbl_id
+    c.lbl_id += 1
+    return l
+}
+
+func (c *Codegen) EmitPreamble() {
+    fputs("; ModuleID = 'cez_selfhosted'\n", c.out_fp)
+    fputs("target triple = \"x86_64-unknown-linux-gnu\"\n", c.out_fp)
+    fputs("target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\n", c.out_fp)
+
+    fputs("declare i32 @printf(i8*, ...)\n", c.out_fp)
+    fputs("declare i32 @puts(i8*)\n", c.out_fp)
+    fputs("declare i8* @malloc(i64)\n", c.out_fp)
+    fputs("declare void @free(i8*)\n", c.out_fp)
+    fputs("declare i8* @fopen(i8*, i8*)\n", c.out_fp)
+    fputs("declare i32 @fclose(i8*)\n", c.out_fp)
+    fputs("declare i64 @fread(i8*, i64, i64, i8*)\n", c.out_fp)
+    fputs("declare i64 @fwrite(i8*, i64, i64, i8*)\n", c.out_fp)
+    fputs("declare i32 @fseek(i8*, i64, i32)\n", c.out_fp)
+    fputs("declare i64 @ftell(i8*)\n", c.out_fp)
+    fputs("declare i32 @system(i8*)\n\n", c.out_fp)
+}
+
+func (c *Codegen) Generate(root *Node) {
+    c.EmitPreamble()
+
+    curr := root.body
+    for uintptr(curr) != 0 {
+        if curr.kind == NODE_FUNC && uintptr(curr.body) != 0 {
+            c.GenerateFunc(curr)
+        }
+        curr = curr.next
+    }
+
+    var s_idx int = 0
+    for s_idx < c.str_count {
+        s_val := c.strings[s_idx]
+        s_len := StrLen(s_val) + 1
+        fprintf(c.out_fp, "@.str.%d = private unnamed_addr constant [%lu x i8] c\"%s\\00\", align 1\n", s_idx, s_len, s_val)
+        s_idx += 1
+    }
+}
+
+func (c *Codegen) GenerateFunc(f *Node) {
+    c.reg_id = 1
+    c.defer_count = 0
+    c.current_func_name = f.name
+    c.func_returned = false
+
+    fprintf(c.out_fp, "define i32 @%s()", f.name)
+    if f.int_val == 1 {
+        fputs(" naked", c.out_fp)
+    }
+    fputs(" {\nentry:\n", c.out_fp)
+
+    // Body
+    if uintptr(f.body) != 0 {
+        stmt := f.body.body
+        for uintptr(stmt) != 0 {
+            c.GenerateStmt(stmt)
+            stmt = stmt.next
+        }
+    }
+
+    if !c.func_returned {
+        c.ExecuteDefers()
+        fputs("  ret i32 0\n", c.out_fp)
+    }
+
+    fputs("}\n\n", c.out_fp)
+}
+
+func (c *Codegen) ExecuteDefers() {
+    var i int = c.defer_count - 1
+    for i >= 0 {
+        c.GenerateExpr(c.defers[i])
+        i -= 1
+    }
+    c.defer_count = 0
+}
+
+func (c *Codegen) GenerateStmt(stmt *Node) {
+    if stmt.kind == NODE_VAR_DECL {
+        // alloca
+        fprintf(c.out_fp, "  %%%s = alloca i64, align 8\n", stmt.name)
+        if uintptr(stmt.init) != 0 {
+            val_reg := c.GenerateExpr(stmt.init)
+            fprintf(c.out_fp, "  store i64 %%%s, i64* %%%s, align 8\n", val_reg, stmt.name)
+        }
+    } else if stmt.kind == NODE_ASSIGN {
+        val_reg := c.GenerateExpr(stmt.right)
+        target_name := stmt.left.name
+        fprintf(c.out_fp, "  store i64 %%%s, i64* %%%s, align 8\n", val_reg, target_name)
+    } else if stmt.kind == NODE_RETURN {
+        var ret_reg *i8 = "0"
+        if uintptr(stmt.left) != 0 {
+            ret_reg = c.GenerateExpr(stmt.left)
+        }
+        c.ExecuteDefers()
+        fprintf(c.out_fp, "  %%ret.trunc = trunc i64 %%%s to i32\n", ret_reg)
+        fprintf(c.out_fp, "  ret i32 %%ret.trunc\n")
+        c.func_returned = true
+    } else if stmt.kind == NODE_DEFER {
+        if c.defer_count < 32 {
+            c.defers[c.defer_count] = stmt.left
+            c.defer_count += 1
+        }
+    } else if stmt.kind == NODE_IF {
+        cond_reg := c.GenerateExpr(stmt.cond)
+        lbl_then := c.NewLabel()
+        lbl_else := c.NewLabel()
+        lbl_end := c.NewLabel()
+
+        target_false := lbl_end
+        if uintptr(stmt.right) != 0 {
+            target_false = lbl_else
+        }
+
+        fprintf(c.out_fp, "  br i1 %%%s, label %%lbl.%d, label %%lbl.%d\n", cond_reg, lbl_then, target_false)
+
+        // Then
+        fprintf(c.out_fp, "lbl.%d:\n", lbl_then)
+        then_stmt := stmt.body.body
+        for uintptr(then_stmt) != 0 {
+            c.GenerateStmt(then_stmt)
+            then_stmt = then_stmt.next
+        }
+        fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_end)
+
+        // Else
+        if uintptr(stmt.right) != 0 {
+            fprintf(c.out_fp, "lbl.%d:\n", lbl_else)
+            else_stmt := stmt.right.body
+            for uintptr(else_stmt) != 0 {
+                c.GenerateStmt(else_stmt)
+                else_stmt = else_stmt.next
+            }
+            fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_end)
+        }
+
+        fprintf(c.out_fp, "lbl.%d:\n", lbl_end)
+    } else if stmt.kind == NODE_EXPR_STMT {
+        c.GenerateExpr(stmt.left)
+    }
+}
+
+func (c *Codegen) GenerateExpr(expr *Node) *i8 {
+    if expr.kind == NODE_INT_LIT {
+        r := c.NewReg()
+        fprintf(c.out_fp, "  %%r%d = add i64 0, %ld\n", r, expr.int_val)
+        buf := malloc(32)
+        sprintf(buf, "r%d", r)
+        return (*i8)(uintptr(buf))
+    }
+
+    if expr.kind == NODE_IDENT {
+        r := c.NewReg()
+        fprintf(c.out_fp, "  %%r%d = load i64, i64* %%%s, align 8\n", r, expr.name)
+        buf := malloc(32)
+        sprintf(buf, "r%d", r)
+        return (*i8)(uintptr(buf))
+    }
+
+    if expr.kind == NODE_STR_LIT {
+        s_id := c.str_count
+        if c.str_count < 128 {
+            c.strings[c.str_count] = expr.str_val
+            c.str_count += 1
+        }
+        str_len := StrLen(expr.str_val) + 1
+
+        fprintf(c.out_fp, "  %%str.%d = getelementptr inbounds [%lu x i8], [%lu x i8]* @.str.%d, i64 0, i64 0\n",
+                s_id, str_len, str_len, s_id)
+
+        buf := malloc(32)
+        sprintf(buf, "str.%d", s_id)
+        return (*i8)(uintptr(buf))
+    }
+
+    if expr.kind == NODE_BINARY {
+        l_reg := c.GenerateExpr(expr.left)
+        r_reg := c.GenerateExpr(expr.right)
+        res_reg := c.NewReg()
+
+        op_str := "add"
+        if expr.op == TOK_MINUS { op_str = "sub" }
+        if expr.op == TOK_STAR { op_str = "mul" }
+        if expr.op == TOK_SLASH { op_str = "sdiv" }
+        if expr.op == TOK_EQ { op_str = "icmp eq" }
+        if expr.op == TOK_NOT_EQ { op_str = "icmp ne" }
+        if expr.op == TOK_LT { op_str = "icmp slt" }
+        if expr.op == TOK_GT { op_str = "icmp sgt" }
+
+        fprintf(c.out_fp, "  %%r%d = %s i64 %%%s, %%%s\n", res_reg, op_str, l_reg, r_reg)
+        buf := malloc(32)
+        sprintf(buf, "r%d", res_reg)
+        return (*i8)(uintptr(buf))
+    }
+
+    if expr.kind == NODE_CALL {
+        func_name := expr.left.name
+        res_reg := c.NewReg()
+
+        // Single argument call e.g. puts(str)
+        if uintptr(expr.args) != 0 {
+            arg_reg := c.GenerateExpr(expr.args)
+            fprintf(c.out_fp, "  %%r%d = call i32 @%s(i8* %%%s)\n", res_reg, func_name, arg_reg)
+        } else {
+            fprintf(c.out_fp, "  %%r%d = call i32 @%s()\n", res_reg, func_name)
+        }
+
+        buf := malloc(32)
+        sprintf(buf, "r%d", res_reg)
+        return (*i8)(uintptr(buf))
+    }
+
+    if expr.kind == NODE_INLINE_ASM {
+        fprintf(c.out_fp, "  call void asm sideeffect \"%s\", \"\"()\n", expr.str_val)
+        return "0"
+    }
+
+    return "0"
+}
+
+extern func sprintf(str *u8, format *i8, ...) i32
