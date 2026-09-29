@@ -1,0 +1,51 @@
+package main
+
+extern func puts(s *i8) i32
+
+func main() int {
+    puts("=== Test 13: Floating Point (f32 / f64) ===")
+
+    // 1. Float literals & basic arithmetic
+    var a f64 = 3.5
+    var b f64 = 2.0
+    sum := a + b    // 5.5
+    diff := a - b   // 1.5
+    prod := a * b   // 7.0
+    quot := a / b   // 1.75
+
+    // 2. Float comparisons
+    if sum <= 5.4 { return 1 }
+    if sum >= 5.6 { return 2 }
+    if diff <= 1.4 { return 3 }
+    if diff >= 1.6 { return 4 }
+    if prod != 7.0 { return 5 }
+    if quot <= 1.74 { return 6 }
+    if quot >= 1.76 { return 7 }
+
+    // 3. Float to int conversion (truncation)
+    int_sum := int(sum) // int(5.5) == 5
+    if int_sum != 5 { return 8 }
+
+    int_prod := int(prod) // int(7.0) == 7
+    if int_prod != 7 { return 9 }
+
+    // 4. Int to float conversion
+    var base_int int = 42
+    flt_base := f64(base_int)
+    if flt_base != 42.0 { return 10 }
+
+    // 5. f32 type and conversions
+    var flt32 f32 = f32(1.25)
+    var flt64 f64 = f64(flt32)
+    if flt64 != 1.25 { return 11 }
+
+    // 6. Practical calculation: Circle area = pi * r * r
+    var pi f64 = 3.1415926535
+    var radius f64 = 10.0
+    area := pi * radius * radius // 314.15926535
+    if area < 314.15 { return 12 }
+    if area > 314.16 { return 13 }
+
+    puts("[PASS] Test 13: Floating Point (f32 / f64) passed cleanly")
+    return 0
+}

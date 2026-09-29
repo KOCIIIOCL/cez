@@ -1,0 +1,136 @@
+package core
+
+// Modular Mark-and-Sweep Garbage Collector for Cez
+// Can be enabled for userland applications, servers, and scripting,
+// and omitted with zero overhead in freestanding OSDev kernels.
+
+extern func malloc(size int) *u8
+extern func free(ptr *u8) void
+
+type GCObject struct {
+    ptr    *u8
+    size   int
+    marked bool
+    next   *GCObject
+}
+
+type GC struct {
+    head            *GCObject
+    total_allocated int
+    threshold       int
+    enabled         bool
+    roots           [256]*u8
+    root_count      int
+}
+
+func (gc *GC) Init(threshold int) {
+    gc.head = (*GCObject)(uintptr(0))
+    gc.total_allocated = 0
+    gc.threshold = threshold
+    gc.enabled = true
+    gc.root_count = 0
+}
+
+func (gc *GC) AddRoot(root *u8) {
+    if gc.root_count < 256 {
+        gc.roots[gc.root_count] = root
+        gc.root_count += 1
+    }
+}
+
+func (gc *GC) RemoveRoot(root *u8) {
+    var i int = 0
+    for i < gc.root_count {
+        if gc.roots[i] == root {
+            gc.roots[i] = gc.roots[gc.root_count - 1]
+            gc.root_count -= 1
+            return
+        }
+        i += 1
+    }
+}
+
+func (gc *GC) Alloc(size int) *u8 {
+    // If threshold exceeded and GC is enabled, collect garbage first
+    if gc.enabled && gc.total_allocated + size > gc.threshold {
+        gc.Collect()
+    }
+
+    raw := malloc(size)
+    if uintptr(raw) == 0 {
+        return (*u8)(uintptr(0))
+    }
+
+    hdr_mem := malloc(32) // sizeof(GCObject)
+    obj := (*GCObject)(uintptr(hdr_mem))
+    obj.ptr = raw
+    obj.size = size
+    obj.marked = false
+    obj.next = gc.head
+    gc.head = obj
+
+    gc.total_allocated += size
+    return raw
+}
+
+func (gc *GC) Collect() int {
+    if !gc.enabled {
+        return 0
+    }
+
+    // 1. Mark phase: mark all objects directly referenced in roots
+    var r_idx int = 0
+    for r_idx < gc.root_count {
+        root_ptr := gc.roots[r_idx]
+        curr := gc.head
+        for uintptr(curr) != 0 {
+            if curr.ptr == root_ptr {
+                curr.marked = true
+            }
+            curr = curr.next
+        }
+        r_idx += 1
+    }
+
+    // 2. Sweep phase: free unmarked objects
+    var freed_bytes int = 0
+    var prev *GCObject = (*GCObject)(uintptr(0))
+    curr := gc.head
+
+    for uintptr(curr) != 0 {
+        next_obj := curr.next
+        if !curr.marked {
+            // Unlink curr
+            if uintptr(prev) == 0 {
+                gc.head = next_obj
+            } else {
+                prev.next = next_obj
+            }
+            freed_bytes += curr.size
+            gc.total_allocated -= curr.size
+            free(curr.ptr)
+            free((*u8)(uintptr(curr)))
+        } else {
+            // Reset mark for next collection cycle
+            curr.marked = false
+            prev = curr
+        }
+        curr = next_obj
+    }
+
+    return freed_bytes
+}
+
+func (gc *GC) ObjectCount() int {
+    var count int = 0
+    curr := gc.head
+    for uintptr(curr) != 0 {
+        count += 1
+        curr = curr.next
+    }
+    return count
+}
+
+func (gc *GC) BytesUsed() int {
+    return gc.total_allocated
+}

@@ -1,0 +1,66 @@
+package main
+
+extern func puts(s *i8) i32
+
+func factorial(n int) int {
+    if n <= 1 {
+        return 1
+    }
+    return n * factorial(n - 1)
+}
+
+func fibonacci(n int) int {
+    if n <= 0 {
+        return 0
+    }
+    if n == 1 {
+        return 1
+    }
+    return fibonacci(n - 1) + fibonacci(n - 2)
+}
+
+func clamp(val int, min_val int, max_val int) int {
+    if val < min_val {
+        return min_val
+    }
+    if val > max_val {
+        return max_val
+    }
+    return val
+}
+
+func ackermann(m int, n int) int {
+    if m == 0 {
+        return n + 1
+    }
+    if m > 0 && n == 0 {
+        return ackermann(m - 1, 1)
+    }
+    return ackermann(m - 1, ackermann(m, n - 1))
+}
+
+func main() int {
+    puts("=== Test 04: Functions & Recursion ===")
+
+    // Factorial
+    if factorial(1) != 1 { return 1 }
+    if factorial(5) != 120 { return 2 }
+    if factorial(7) != 5040 { return 3 }
+
+    // Fibonacci
+    if fibonacci(0) != 0 { return 4 }
+    if fibonacci(1) != 1 { return 5 }
+    if fibonacci(7) != 13 { return 6 }
+    if fibonacci(10) != 55 { return 7 }
+
+    // Clamp
+    if clamp(5, 10, 20) != 10 { return 8 }
+    if clamp(15, 10, 20) != 15 { return 9 }
+    if clamp(25, 10, 20) != 20 { return 10 }
+
+    // Ackermann(2, 3) = 9
+    if ackermann(2, 3) != 9 { return 11 }
+
+    puts("[PASS] Test 04: Functions & Recursion passed cleanly")
+    return 0
+}

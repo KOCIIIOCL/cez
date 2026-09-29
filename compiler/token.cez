@@ -7,6 +7,7 @@ const TOK_IDENT      int = 1
 const TOK_INT        int = 2
 const TOK_STRING     int = 3
 const TOK_CHAR       int = 4
+const TOK_FLOAT      int = 5
 
 // Keywords
 const TOK_PACKAGE    int = 10
@@ -71,6 +72,8 @@ const TOK_DOT        int = 77 // .
 const TOK_COLON      int = 78 // :
 const TOK_SEMICOLON  int = 79 // ;
 const TOK_ELLIPSIS   int = 80 // ...
+const TOK_AT_VSTORE  int = 81 // @volatile_store
+const TOK_AT_VLOAD   int = 82 // @volatile_load
 
 type Token struct {
     kind    int
@@ -78,4 +81,14 @@ type Token struct {
     col     int
     int_val int
     str_val *i8
+}
+
+func MakeToken(kind int, line int, col int, int_val int, str_val *i8) Token {
+    var tok Token
+    tok.kind = kind
+    tok.line = line
+    tok.col = col
+    tok.int_val = int_val
+    tok.str_val = str_val
+    return tok
 }

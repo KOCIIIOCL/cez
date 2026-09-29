@@ -4,6 +4,7 @@ package main
 
 extern func fputs(s *i8, stream *i8) i32
 extern func fprintf(stream *i8, format *i8, ...) i32
+extern func sprintf(str *u8, format *i8, ...) i32
 
 type Codegen struct {
     out_fp            *i8
@@ -12,12 +13,32 @@ type Codegen struct {
     defer_count       int
     defers            [32]*Node
     str_count         int
-    strings           [128]*i8
+    strings           [1024]*i8
     loop_count        int
     loop_posts        [32]int
     loop_exits        [32]int
     current_func_name *i8
     func_returned     bool
+    local_count       int
+    local_names       [128]*i8
+    local_types       [128]*i8
+    func_ret_ty       *i8
+    struct_count      int
+    struct_names      [64]*i8
+    struct_packed     [64]bool
+    struct_field_cnt  [64]int
+    struct_field_names [64][40]*i8
+    struct_field_types [64][40]*i8
+    func_count        int
+    func_names        [128]*i8
+    func_rets         [128]*i8
+    func_pcount       [128]int
+    func_ptypes       [128][8]*i8
+    const_count       int
+    const_names       [128]*i8
+    const_is_str      [128]bool
+    const_ints        [128]int
+    const_strs        [128]*i8
 }
 
 func (c *Codegen) Init(out_fp *i8) {
@@ -28,6 +49,11 @@ func (c *Codegen) Init(out_fp *i8) {
     c.str_count = 0
     c.loop_count = 0
     c.func_returned = false
+    c.local_count = 0
+    c.func_ret_ty = "i64"
+    c.struct_count = 0
+    c.func_count = 0
+    c.const_count = 0
 }
 
 func (c *Codegen) NewReg() int {
@@ -70,13 +96,970 @@ func (c *Codegen) GetLoopExit() int {
     return 0
 }
 
+func (c *Codegen) AddLocal(name *i8, type_str *i8) {
+    if c.local_count < 128 {
+        c.local_names[c.local_count] = name
+        c.local_types[c.local_count] = type_str
+        c.local_count += 1
+    }
+}
+
+func (c *Codegen) IsLocal(name *i8) bool {
+    var i int = 0
+    for i < c.local_count {
+        if StrEq(c.local_names[i], name) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+func (c *Codegen) GetLocalType(name *i8) *i8 {
+    var i int = 0
+    for i < c.local_count {
+        if StrEq(c.local_names[i], name) {
+            return c.local_types[i]
+        }
+        i += 1
+    }
+    return (*i8)(uintptr(0))
+}
+
+func StrStartsWith(s *i8, prefix *i8) bool {
+    if uintptr(s) == 0 || uintptr(prefix) == 0 {
+        return false
+    }
+    plen := StrLen(prefix)
+    slen := StrLen(s)
+    if slen < plen {
+        return false
+    }
+    var i usize = 0
+    for i < plen {
+        if *((*u8)(uintptr(s) + i)) != *((*u8)(uintptr(prefix) + i)) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+func IsBuiltinTypeStr(ty *i8) bool {
+    if StrEq(ty, "int") || StrEq(ty, "i8") || StrEq(ty, "u8") ||
+       StrEq(ty, "i16") || StrEq(ty, "u16") || StrEq(ty, "i32") || StrEq(ty, "u32") ||
+       StrEq(ty, "i64") || StrEq(ty, "u64") || StrEq(ty, "uint") ||
+       StrEq(ty, "usize") || StrEq(ty, "isize") || StrEq(ty, "uintptr") ||
+       StrEq(ty, "bool") || StrEq(ty, "void") || StrEq(ty, "string") ||
+       StrEq(ty, "f32") || StrEq(ty, "f64") {
+        return true
+    }
+    return false
+}
+
+// LlvmStripStar removes one trailing '*' from an LLVM type string
+// ("i8**" -> "i8*", "%struct.Node*" -> "%struct.Node").
+func LlvmStripStar(ty *i8) *i8 {
+    tlen := StrLen(ty)
+    if tlen > 1 && *((*u8)(uintptr(ty) + tlen - 1)) == u8(42) {
+        buf := malloc(64)
+        memcpy((*u8)(uintptr(buf)), (*u8)(uintptr(ty)), tlen - 1)
+        *((*u8)(uintptr(buf) + tlen - 1)) = u8(0)
+        return (*i8)(uintptr(buf))
+    }
+    return ty
+}
+
+// LlvmArrayElem extracts the element type from "[N x T]".
+func LlvmArrayElem(ty *i8) *i8 {
+    tlen := StrLen(ty)
+    if tlen < 6 || *((*u8)(uintptr(ty))) != u8(91) { // '['
+        return ty
+    }
+    var i usize = 1
+    for i < tlen - 3 {
+        b0 := *((*u8)(uintptr(ty) + i))
+        b1 := *((*u8)(uintptr(ty) + i + 1))
+        b2 := *((*u8)(uintptr(ty) + i + 2))
+        if b0 == u8(32) && b1 == u8(120) && b2 == u8(32) { // " x "
+            break
+        }
+        i += 1
+    }
+    if i >= tlen - 3 {
+        return ty
+    }
+    start := i + 3
+    end := tlen - 1 // exclude final ']'
+    if end <= start {
+        return ty
+    }
+    n := end - start
+    buf := malloc(96)
+    memcpy((*u8)(uintptr(buf)), (*u8)(uintptr(ty) + start), n)
+    *((*u8)(uintptr(buf) + n)) = u8(0)
+    return (*i8)(uintptr(buf))
+}
+
+// TypeStrToLlvm maps a Cez source type string ("*Node", "u16", "[8]*i8",
+// "PacketHeader") to its LLVM IR representation.
+func (c *Codegen) TypeStrToLlvm(ty *i8) *i8 {
+    if uintptr(ty) == 0 {
+        return "i64"
+    }
+    if StrEq(ty, "bool") { return "i1" }
+    if StrEq(ty, "i8") || StrEq(ty, "u8") { return "i8" }
+    if StrEq(ty, "i16") || StrEq(ty, "u16") { return "i16" }
+    if StrEq(ty, "i32") || StrEq(ty, "u32") { return "i32" }
+    if StrEq(ty, "int") || StrEq(ty, "i64") || StrEq(ty, "u64") || StrEq(ty, "uint") ||
+       StrEq(ty, "usize") || StrEq(ty, "isize") || StrEq(ty, "uintptr") { return "i64" }
+    if StrEq(ty, "f32") { return "float" }
+    if StrEq(ty, "f64") { return "double" }
+    if StrEq(ty, "void") { return "void" }
+    b0 := *((*u8)(uintptr(ty)))
+    if b0 == u8(42) { // '*' — pointer to rest
+        inner := c.TypeStrToLlvm((*i8)(uintptr(ty) + 1))
+        buf := malloc(80)
+        sprintf((*u8)(uintptr(buf)), "%s*", inner)
+        return buf
+    }
+    if b0 == u8(91) { // '[' — "[N]T"
+        n := 0
+        var i usize = 1
+        for *((*u8)(uintptr(ty) + i)) != u8(93) { // ']'
+            d := int(*((*u8)(uintptr(ty) + i))) - 48
+            n = n*10 + d
+            i += 1
+        }
+        elem := c.TypeStrToLlvm((*i8)(uintptr(ty) + i + 1))
+        buf := malloc(112)
+        sprintf((*u8)(uintptr(buf)), "[%d x %s]", n, elem)
+        return buf
+    }
+    buf := malloc(64)
+    sprintf((*u8)(uintptr(buf)), "%%struct.%s", ty)
+    return buf
+}
+
+// LlvmArrayElemOrPtr extracts the pointee type: "[N x T]" -> "T",
+// "T*" -> "T".
+func LlvmArrayElemOrPtr(ty *i8) *i8 {
+    tlen := StrLen(ty)
+    if tlen > 0 && *((*u8)(uintptr(ty) + tlen - 1)) == u8(42) { // '*'
+        return LlvmStripStar(ty)
+    }
+    return LlvmArrayElem(ty)
+}
+
+func (c *Codegen) FindStruct(name *i8) int {
+    var i int = 0
+    for i < c.struct_count {
+        if StrEq(c.struct_names[i], name) {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+func (c *Codegen) FindFunc(name *i8) int {
+    var i int = 0
+    for i < c.func_count {
+        if StrEq(c.func_names[i], name) {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+func (c *Codegen) FindConst(name *i8) int {
+    var i int = 0
+    for i < c.const_count {
+        if StrEq(c.const_names[i], name) {
+            return i
+        }
+        i += 1
+    }
+    return -1
+}
+
+// InternString dedupes a string literal into the @.str.N table, returning its id.
+func (c *Codegen) InternString(s *i8) int {
+    var idx int = 0
+    for idx < c.str_count {
+        if StrEq(c.strings[idx], s) {
+            return idx
+        }
+        idx += 1
+    }
+    if c.str_count < 1024 {
+        c.strings[c.str_count] = s
+        c.str_count += 1
+        return c.str_count - 1
+    }
+    return c.str_count - 1
+}
+
+// StructDepOf returns the base struct name a field type depends on,
+// or 0 for builtin/pointer/array types.
+func (c *Codegen) StructDepOf(ty *i8) *i8 {
+    if uintptr(ty) == 0 {
+        return (*i8)(uintptr(0))
+    }
+    b0 := *((*u8)(uintptr(ty)))
+    if b0 == u8(42) || b0 == u8(91) { // '*' or '['
+        return (*i8)(uintptr(0))
+    }
+    if IsBuiltinTypeStr(ty) {
+        return (*i8)(uintptr(0))
+    }
+    return ty
+}
+
+// ScanTypes collects struct definitions, constants and function signatures
+// from the program AST before any IR is emitted.
+func (c *Codegen) ScanTypes(root *Node) {
+    curr := root.body
+    for uintptr(curr) != 0 {
+        if curr.kind == NODE_STRUCT_DEF {
+            if c.struct_count < 64 {
+                si := c.struct_count
+                c.struct_names[si] = curr.name
+                if curr.int_val == 1 {
+                    c.struct_packed[si] = true
+                }
+                f := curr.body
+                n := 0
+                for uintptr(f) != 0 && n < 40 {
+                    c.struct_field_names[si][n] = f.name
+                    c.struct_field_types[si][n] = f.type_str
+                    n += 1
+                    f = f.next
+                }
+                c.struct_field_cnt[si] = n
+                c.struct_count += 1
+            }
+        } else if curr.kind == NODE_CONST {
+            if c.const_count < 128 {
+                ci := c.const_count
+                c.const_names[ci] = curr.name
+                c.const_is_str[ci] = false
+                c.const_ints[ci] = 0
+                c.const_strs[ci] = (*i8)(uintptr(0))
+                if uintptr(curr.init) != 0 {
+                    if curr.init.kind == NODE_STR_LIT {
+                        c.const_is_str[ci] = true
+                        c.const_strs[ci] = curr.init.str_val
+                    } else if curr.init.kind == NODE_INT_LIT {
+                        c.const_ints[ci] = curr.init.int_val
+                    }
+                }
+                c.const_count += 1
+            }
+        } else if curr.kind == NODE_FUNC {
+            if c.func_count < 128 {
+                fi := c.func_count
+                c.func_names[fi] = curr.name
+                var ret *i8 = "void"
+                if StrEq(curr.name, "main") {
+                    ret = "i32"
+                } else if uintptr(curr.type_str) != 0 {
+                    ret = c.TypeStrToLlvm(curr.type_str)
+                }
+                c.func_rets[fi] = ret
+                pc := 0
+                pn := curr.args
+                for uintptr(pn) != 0 && pc < 8 {
+                    c.func_ptypes[fi][pc] = c.TypeStrToLlvm(pn.type_str)
+                    pc += 1
+                    pn = pn.next
+                }
+                c.func_pcount[fi] = pc
+                c.func_count += 1
+            }
+        }
+        curr = curr.next
+    }
+}
+
+func (c *Codegen) EmitStructType(si int) {
+    name := c.struct_names[si]
+    if c.struct_packed[si] {
+        fprintf(c.out_fp, "%%struct.%s = type <{ ", name)
+    } else {
+        fprintf(c.out_fp, "%%struct.%s = type { ", name)
+    }
+    var fi int = 0
+    for fi < c.struct_field_cnt[si] {
+        if fi > 0 {
+            fputs(", ", c.out_fp)
+        }
+        fputs(c.TypeStrToLlvm(c.struct_field_types[si][fi]), c.out_fp)
+        fi += 1
+    }
+    if c.struct_packed[si] {
+        fputs(" }>\n", c.out_fp)
+    } else {
+        fputs(" }\n", c.out_fp)
+    }
+}
+
+// EmitGlobalVar emits a typed global with optional @align/@section attributes
+// and constant initializer (int, string, or struct literal).
+func (c *Codegen) EmitGlobalVar(v *Node) {
+    var llvm_ty *i8 = "i64"
+    if uintptr(v.type_str) != 0 {
+        llvm_ty = c.TypeStrToLlvm(v.type_str)
+    }
+    init_buf := malloc(1024)
+    sprintf((*u8)(uintptr(init_buf)), "zeroinitializer")
+    if uintptr(v.init) != 0 {
+        if v.init.kind == NODE_INT_LIT {
+            sprintf((*u8)(uintptr(init_buf)), "%ld", v.init.int_val)
+        } else if v.init.kind == NODE_FLOAT_LIT {
+            sprintf((*u8)(uintptr(init_buf)), "%s", v.init.str_val)
+        } else if v.init.kind == NODE_STR_LIT {
+            sid := c.InternString(v.init.str_val)
+            slen := int(StrLen(v.init.str_val) + 1)
+            sprintf((*u8)(uintptr(init_buf)), "i8* getelementptr inbounds ([%d x i8], [%d x i8]* @.str.%d, i64 0, i64 0)", slen, slen, sid)
+        } else if v.init.kind == NODE_STRUCT_LIT {
+            sprintf((*u8)(uintptr(init_buf)), "{ ")
+            off := int(StrLen(init_buf))
+            f := v.init.args
+            for uintptr(f) != 0 {
+                fty := c.GetFieldType(v.type_str, f.name)
+                vb := malloc(32)
+                sprintf((*u8)(uintptr(vb)), "0")
+                if uintptr(f.right) != 0 && f.right.kind == NODE_INT_LIT {
+                    sprintf((*u8)(uintptr(vb)), "%ld", f.right.int_val)
+                }
+                sprintf((*u8)(uintptr(init_buf) + off), "%s %s, ", fty, vb)
+                off = int(StrLen(init_buf))
+                f = f.next
+            }
+            if off > 2 {
+                sprintf((*u8)(uintptr(init_buf) + off - 2), " }")
+            } else {
+                sprintf((*u8)(uintptr(init_buf)), "zeroinitializer")
+            }
+        }
+    } else {
+        if StrEq(llvm_ty, "i64") || StrEq(llvm_ty, "i32") || StrEq(llvm_ty, "i16") || StrEq(llvm_ty, "i8") {
+            sprintf((*u8)(uintptr(init_buf)), "0")
+        } else if StrEq(llvm_ty, "double") || StrEq(llvm_ty, "float") {
+            sprintf((*u8)(uintptr(init_buf)), "0.0")
+        }
+    }
+    fprintf(c.out_fp, "@%s = global %s %s", v.name, llvm_ty, init_buf)
+    if v.int_val > 0 {
+        fprintf(c.out_fp, ", align %d", v.int_val)
+    }
+    if uintptr(v.str_val) != 0 {
+        fprintf(c.out_fp, ", section \"%s\"", v.str_val)
+    }
+    fputs("\n", c.out_fp)
+}
+
+func (c *Codegen) InferStructName(node *Node) *i8 {
+    if node.kind == NODE_IDENT {
+        ty := c.GetLocalType(node.name)
+        if uintptr(ty) != 0 {
+            if *((*u8)(uintptr(ty))) == u8(42) {
+                return (*i8)(uintptr(ty) + 1)
+            }
+            if !IsBuiltinTypeStr(ty) && *((*u8)(uintptr(ty))) != u8(91) { // not builtin, not '['
+                return ty
+            }
+        }
+        if StrEq(node.name, "p") || StrEq(node.name, "parser") { return "Parser" }
+        if StrEq(node.name, "l") || StrEq(node.name, "lexer") { return "Lexer" }
+        if StrEq(node.name, "c") || StrEq(node.name, "codegen") { return "Codegen" }
+        if StrEq(node.name, "arena") || StrEq(node.name, "a") { return "Arena" }
+        if StrEq(node.name, "file") { return "FileData" }
+        if StrEq(node.name, "tok") || StrEq(node.name, "cur_tok") || StrEq(node.name, "func_tok") ||
+           StrEq(node.name, "op_tok") || StrEq(node.name, "attr_tok") { return "Token" }
+        return "Node"
+    } else if node.kind == NODE_MEMBER {
+        if StrEq(node.name, "cur_tok") { return "Token" }
+        if StrEq(node.name, "lexer") { return "Lexer" }
+        if StrEq(node.name, "arena") { return "Arena" }
+        // Struct-typed member: struct of the field's type (strip pointer)
+        parent := c.InferStructName(node.left)
+        fty := c.GetFieldType(parent, node.name)
+        if uintptr(fty) != 0 {
+            tlen := StrLen(fty)
+            if tlen >= 9 && StrStartsWith(fty, "%struct.") {
+                var nlen usize = tlen - 8
+                if *((*u8)(uintptr(fty) + tlen - 1)) == u8(42) { // trailing '*'
+                    nlen = tlen - 9
+                }
+                buf := malloc(64)
+                memcpy((*u8)(uintptr(buf)), (*u8)(uintptr(fty) + 8), nlen)
+                *((*u8)(uintptr(buf) + nlen)) = u8(0)
+                return buf
+            }
+        }
+        return "Node"
+    } else if node.kind == NODE_CALL {
+        if uintptr(node.left) != 0 && node.left.kind == NODE_MEMBER {
+            m_name := node.left.name
+            if StrEq(m_name, "Advance") || StrEq(m_name, "NextToken") || StrEq(m_name, "Consume") {
+                return "Token"
+            }
+        }
+        return "Node"
+    }
+    return "Node"
+}
+
+func (c *Codegen) GetFieldIdx(struct_name *i8, field_name *i8) int {
+    si := c.FindStruct(struct_name)
+    if si >= 0 {
+        var fi int = 0
+        for fi < c.struct_field_cnt[si] {
+            if StrEq(c.struct_field_names[si][fi], field_name) {
+                return fi
+            }
+            fi += 1
+        }
+        return 0
+    }
+    if StrEq(struct_name, "Node") {
+        if StrEq(field_name, "kind") { return 0 }
+        if StrEq(field_name, "line") { return 1 }
+        if StrEq(field_name, "col") { return 2 }
+        if StrEq(field_name, "name") { return 3 }
+        if StrEq(field_name, "int_val") { return 4 }
+        if StrEq(field_name, "str_val") { return 5 }
+        if StrEq(field_name, "type_str") { return 6 }
+        if StrEq(field_name, "is_ptr") { return 7 }
+        if StrEq(field_name, "op") { return 8 }
+        if StrEq(field_name, "left") { return 9 }
+        if StrEq(field_name, "right") { return 10 }
+        if StrEq(field_name, "cond") { return 11 }
+        if StrEq(field_name, "init") { return 12 }
+        if StrEq(field_name, "post") { return 13 }
+        if StrEq(field_name, "body") { return 14 }
+        if StrEq(field_name, "next") { return 15 }
+        if StrEq(field_name, "args") { return 16 }
+    } else if StrEq(struct_name, "Token") {
+        if StrEq(field_name, "kind") { return 0 }
+        if StrEq(field_name, "line") { return 1 }
+        if StrEq(field_name, "col") { return 2 }
+        if StrEq(field_name, "int_val") { return 3 }
+        if StrEq(field_name, "str_val") { return 4 }
+    } else if StrEq(struct_name, "Parser") {
+        if StrEq(field_name, "lexer") { return 0 }
+        if StrEq(field_name, "cur_tok") { return 1 }
+        if StrEq(field_name, "arena") { return 2 }
+        if StrEq(field_name, "no_struct_lit") { return 3 }
+    } else if StrEq(struct_name, "Lexer") {
+        if StrEq(field_name, "src") { return 0 }
+        if StrEq(field_name, "len") { return 1 }
+        if StrEq(field_name, "pos") { return 2 }
+        if StrEq(field_name, "line") { return 3 }
+        if StrEq(field_name, "col") { return 4 }
+        if StrEq(field_name, "prev_kind") { return 5 }
+        if StrEq(field_name, "arena") { return 6 }
+    } else if StrEq(struct_name, "Arena") {
+        if StrEq(field_name, "buffer") { return 0 }
+        if StrEq(field_name, "capacity") { return 1 }
+        if StrEq(field_name, "offset") { return 2 }
+    } else if StrEq(struct_name, "FileData") {
+        if StrEq(field_name, "data") { return 0 }
+        if StrEq(field_name, "size") { return 1 }
+    } else if StrEq(struct_name, "Codegen") {
+        if StrEq(field_name, "out_fp") { return 0 }
+        if StrEq(field_name, "reg_id") { return 1 }
+        if StrEq(field_name, "lbl_id") { return 2 }
+        if StrEq(field_name, "defer_count") { return 3 }
+        if StrEq(field_name, "defers") { return 4 }
+        if StrEq(field_name, "str_count") { return 5 }
+        if StrEq(field_name, "strings") { return 6 }
+        if StrEq(field_name, "loop_count") { return 7 }
+        if StrEq(field_name, "loop_posts") { return 8 }
+        if StrEq(field_name, "loop_exits") { return 9 }
+        if StrEq(field_name, "current_func_name") { return 10 }
+        if StrEq(field_name, "func_returned") { return 11 }
+        if StrEq(field_name, "local_count") { return 12 }
+        if StrEq(field_name, "local_names") { return 13 }
+        if StrEq(field_name, "local_types") { return 14 }
+        if StrEq(field_name, "func_ret_ty") { return 15 }
+        if StrEq(field_name, "struct_count") { return 16 }
+        if StrEq(field_name, "struct_names") { return 17 }
+        if StrEq(field_name, "struct_packed") { return 18 }
+        if StrEq(field_name, "struct_field_cnt") { return 19 }
+        if StrEq(field_name, "struct_field_names") { return 20 }
+        if StrEq(field_name, "struct_field_types") { return 21 }
+        if StrEq(field_name, "func_count") { return 22 }
+        if StrEq(field_name, "func_names") { return 23 }
+        if StrEq(field_name, "func_rets") { return 24 }
+        if StrEq(field_name, "func_pcount") { return 25 }
+        if StrEq(field_name, "func_ptypes") { return 26 }
+        if StrEq(field_name, "const_count") { return 27 }
+        if StrEq(field_name, "const_names") { return 28 }
+        if StrEq(field_name, "const_is_str") { return 29 }
+        if StrEq(field_name, "const_ints") { return 30 }
+        if StrEq(field_name, "const_strs") { return 31 }
+    }
+    return 0
+}
+
+func (c *Codegen) GetFieldType(struct_name *i8, field_name *i8) *i8 {
+    si := c.FindStruct(struct_name)
+    if si >= 0 {
+        var fi int = 0
+        for fi < c.struct_field_cnt[si] {
+            if StrEq(c.struct_field_names[si][fi], field_name) {
+                return c.TypeStrToLlvm(c.struct_field_types[si][fi])
+            }
+            fi += 1
+        }
+        return "i64"
+    }
+    if StrEq(struct_name, "Parser") {
+        if StrEq(field_name, "lexer") { return "%struct.Lexer" }
+        if StrEq(field_name, "cur_tok") { return "%struct.Token" }
+        if StrEq(field_name, "arena") { return "%struct.Arena*" }
+        if StrEq(field_name, "no_struct_lit") { return "i1" }
+    } else if StrEq(struct_name, "Token") {
+        if StrEq(field_name, "str_val") { return "i8*" }
+        return "i64"
+    } else if StrEq(struct_name, "Node") {
+        if StrEq(field_name, "is_ptr") {
+            return "i1"
+        }
+        if StrEq(field_name, "name") || StrEq(field_name, "str_val") || StrEq(field_name, "type_str") {
+            return "i8*"
+        }
+        if StrEq(field_name, "left") || StrEq(field_name, "right") || StrEq(field_name, "cond") ||
+           StrEq(field_name, "init") || StrEq(field_name, "post") || StrEq(field_name, "body") ||
+           StrEq(field_name, "next") || StrEq(field_name, "args") {
+            return "%struct.Node*"
+        }
+        return "i64"
+    } else if StrEq(struct_name, "Lexer") {
+        if StrEq(field_name, "src") { return "i8*" }
+        if StrEq(field_name, "arena") { return "%struct.Arena*" }
+        return "i64"
+    } else if StrEq(struct_name, "Arena") {
+        if StrEq(field_name, "buffer") { return "i8*" }
+        return "i64"
+    } else if StrEq(struct_name, "FileData") {
+        if StrEq(field_name, "data") { return "i8*" }
+        return "i64"
+    } else if StrEq(struct_name, "Codegen") {
+        if StrEq(field_name, "out_fp") || StrEq(field_name, "current_func_name") || StrEq(field_name, "func_ret_ty") { return "i8*" }
+        if StrEq(field_name, "func_returned") { return "i1" }
+        return "i64"
+    }
+    return "i64"
+}
+
+func (c *Codegen) InferMethodStruct(method_name *i8, target *Node) *i8 {
+    // Dynamic lookup first: if "Struct_Method" exists in the function table,
+    // the method belongs to that struct.
+    if uintptr(target) != 0 {
+        t_name := c.InferStructName(target)
+        mangled := malloc(128)
+        sprintf((*u8)(uintptr(mangled)), "%s_%s", t_name, method_name)
+        if c.FindFunc(mangled) >= 0 {
+            return t_name
+        }
+        if StrEq(t_name, "Codegen") || StrEq(t_name, "Lexer") || StrEq(t_name, "Arena") || StrEq(t_name, "Parser") {
+            return t_name
+        }
+    }
+    if StrEq(method_name, "Init") {
+        return c.InferStructName(target)
+    }
+    if StrEq(method_name, "Peek") || StrEq(method_name, "Advance") {
+        if uintptr(target) != 0 && target.kind == NODE_MEMBER {
+            if StrEq(target.name, "lexer") { return "Lexer" }
+        }
+        t_name := c.InferStructName(target)
+        if StrEq(t_name, "Lexer") { return "Lexer" }
+        return "Parser"
+    }
+    if StrEq(method_name, "PeekNext") || StrEq(method_name, "NextToken") {
+        return "Lexer"
+    }
+    if StrEq(method_name, "Alloc") || StrEq(method_name, "Reset") ||
+       StrEq(method_name, "BytesUsed") || StrEq(method_name, "BytesAvailable") {
+        return "Arena"
+    }
+    if StrEq(method_name, "NewReg") || StrEq(method_name, "NewLabel") ||
+       StrEq(method_name, "PushLoop") || StrEq(method_name, "PopLoop") ||
+       StrEq(method_name, "GetLoopPost") || StrEq(method_name, "GetLoopExit") ||
+       StrEq(method_name, "EmitPreamble") || StrEq(method_name, "Generate") ||
+       StrEq(method_name, "GenerateFunc") || StrEq(method_name, "ExecuteDefers") ||
+       StrEq(method_name, "GenerateStmt") || StrEq(method_name, "GenerateExpr") ||
+       StrEq(method_name, "AddLocal") || StrEq(method_name, "IsLocal") ||
+       StrEq(method_name, "GetLocalType") || StrEq(method_name, "InferStructName") ||
+       StrEq(method_name, "GetFieldIdx") || StrEq(method_name, "GetFieldType") ||
+       StrEq(method_name, "InferMethodStruct") || StrEq(method_name, "GetMethodReturnType") ||
+       StrEq(method_name, "GenerateExprPtr") || StrEq(method_name, "InferExprType") ||
+       StrEq(method_name, "LlvmTypeToTypeStr") || StrEq(method_name, "IsExprPointer") ||
+       StrEq(method_name, "EmitEscapedString") || StrEq(method_name, "ScanVarDecl") {
+        return "Codegen"
+    }
+    return "Parser"
+}
+
+func (c *Codegen) GetMethodReturnType(struct_name *i8, method_name *i8) *i8 {
+    // Dynamic lookup first: mangled "Struct_Method" function table entry.
+    mangled := malloc(128)
+    sprintf((*u8)(uintptr(mangled)), "%s_%s", struct_name, method_name)
+    fi := c.FindFunc(mangled)
+    if fi >= 0 {
+        return c.func_rets[fi]
+    }
+    if StrEq(method_name, "NextToken") || StrEq(method_name, "Advance") || StrEq(method_name, "Consume") {
+        if StrEq(struct_name, "Lexer") && StrEq(method_name, "Advance") { return "i8" }
+        return "%struct.Token"
+    }
+    if StrEq(method_name, "Peek") || StrEq(method_name, "PeekNext") {
+        if StrEq(struct_name, "Lexer") { return "i8" }
+        return "i64"
+    }
+    if StrEq(method_name, "ParseProgram") || StrEq(method_name, "ParseTopLevelDecl") ||
+       StrEq(method_name, "ParseBlock") || StrEq(method_name, "ParseStmt") ||
+       StrEq(method_name, "ParseExpr") || StrEq(method_name, "ParseBinary") ||
+       StrEq(method_name, "ParseUnary") || StrEq(method_name, "ParsePrimary") {
+        return "%struct.Node*"
+    }
+    if StrEq(method_name, "ParseTypeString") || StrEq(method_name, "Alloc") || StrEq(method_name, "GenerateExpr") ||
+       StrEq(method_name, "GetLocalType") || StrEq(method_name, "InferStructName") || StrEq(method_name, "GetFieldType") ||
+       StrEq(method_name, "InferMethodStruct") || StrEq(method_name, "GetMethodReturnType") || StrEq(method_name, "GenerateExprPtr") ||
+       StrEq(method_name, "InferExprType") || StrEq(method_name, "LlvmTypeToTypeStr") {
+        return "i8*"
+    }
+    if StrEq(method_name, "IsLocal") || StrEq(method_name, "IsExprPointer") {
+        return "i1"
+    }
+    if StrEq(method_name, "AddLocal") || StrEq(method_name, "Init") || StrEq(method_name, "SkipSemicolons") ||
+       StrEq(method_name, "PushLoop") || StrEq(method_name, "PopLoop") ||
+       StrEq(method_name, "EmitPreamble") || StrEq(method_name, "Generate") ||
+       StrEq(method_name, "GenerateFunc") || StrEq(method_name, "ExecuteDefers") ||
+       StrEq(method_name, "GenerateStmt") || StrEq(method_name, "EmitEscapedString") || StrEq(method_name, "Reset") ||
+       StrEq(method_name, "ScanVarDecl") {
+        return "void"
+    }
+    return "i64"
+}
+
+func (c *Codegen) InferExprType(expr *Node) *i8 {
+    if uintptr(expr) == 0 { return "i64" }
+    if expr.kind == NODE_STR_LIT { return "i8*" }
+    if expr.kind == NODE_INT_LIT { return "i64" }
+    if expr.kind == NODE_FLOAT_LIT { return "double" }
+    if expr.kind == NODE_IDENT {
+        if StrEq(expr.name, "true") || StrEq(expr.name, "false") { return "i1" }
+        if StrEq(expr.name, "nil") { return "i8*" }
+        ty := c.GetLocalType(expr.name)
+        if uintptr(ty) != 0 {
+            return c.TypeStrToLlvm(ty)
+        }
+        ci := c.FindConst(expr.name)
+        if ci >= 0 {
+            if c.const_is_str[ci] { return "i8*" }
+            return "i64"
+        }
+        return "i64"
+    }
+    if expr.kind == NODE_MEMBER {
+        struct_name := c.InferStructName(expr.left)
+        return c.GetFieldType(struct_name, expr.name)
+    }
+    if expr.kind == NODE_CALL {
+        if expr.left.kind == NODE_MEMBER {
+            m_struct := c.InferMethodStruct(expr.left.name, expr.left.left)
+            ret := c.GetMethodReturnType(m_struct, expr.left.name)
+            // Narrow int method results are widened to i64 (method emission zexts).
+            if StrEq(ret, "i8") || StrEq(ret, "i16") || StrEq(ret, "i32") {
+                return "i64"
+            }
+            return ret
+        }
+        if expr.left.kind == NODE_IDENT {
+            called_fn := expr.left.name
+            fi := c.FindFunc(called_fn)
+            if fi >= 0 {
+                return c.func_rets[fi]
+            }
+            if StrEq(called_fn, "AllocNode") { return "%struct.Node*" }
+            if StrEq(called_fn, "MakeToken") { return "%struct.Token" }
+            if StrEq(called_fn, "MakeFileData") || StrEq(called_fn, "ReadFile") { return "%struct.FileData" }
+            if StrEq(called_fn, "malloc") || StrEq(called_fn, "fopen") || StrEq(called_fn, "getenv") { return "i8*" }
+            if StrEq(called_fn, "StrEq") || StrEq(called_fn, "CanPrecedeSemicolon") || StrEq(called_fn, "WriteFile") { return "i1" }
+            if StrEq(called_fn, "u8") || StrEq(called_fn, "i8") { return "i64" }
+            if StrEq(called_fn, "u16") || StrEq(called_fn, "i16") { return "i64" }
+            if StrEq(called_fn, "u32") || StrEq(called_fn, "i32") { return "i64" }
+            if StrEq(called_fn, "f32") { return "float" }
+            if StrEq(called_fn, "f64") { return "double" }
+        }
+        if expr.left.kind == NODE_UNARY && expr.left.op == TOK_STAR {
+            if expr.left.left.kind == NODE_IDENT {
+                // (*T)(x): pointer type to T
+                tn := expr.left.left.name
+                buf := malloc(80)
+                sprintf((*u8)(uintptr(buf)), "%s*", c.TypeStrToLlvm(tn))
+                return buf
+            }
+            if expr.left.left.kind == NODE_UNARY {
+                return "i8**"
+            }
+        }
+        return "i64"
+    }
+    if expr.kind == NODE_BINARY {
+        if expr.op >= TOK_EQ && expr.op <= TOK_OR {
+            return "i1"
+        }
+        l_ty := c.InferExprType(expr.left)
+        r_ty := c.InferExprType(expr.right)
+        if StrEq(l_ty, "double") || StrEq(r_ty, "double") { return "double" }
+        if StrEq(l_ty, "float") || StrEq(r_ty, "float") { return "float" }
+        return "i64"
+    }
+    if expr.kind == NODE_INDEX {
+        // Element type of the indexed array/pointer: from local var type or
+        // struct field type ("[N]T" -> "T", "*T" -> "T").
+        base := expr.left
+        if base.kind == NODE_IDENT {
+            ty := c.GetLocalType(base.name)
+            if uintptr(ty) != 0 {
+                if *((*u8)(uintptr(ty))) == u8(91) { // '['
+                    var i usize = 0
+                    for *((*u8)(uintptr(ty) + i)) != u8(93) { // ']'
+                        i += 1
+                    }
+                    return c.TypeStrToLlvm((*i8)(uintptr(ty) + i + 1))
+                }
+                if *((*u8)(uintptr(ty))) == u8(42) { // '*'
+                    return c.TypeStrToLlvm((*i8)(uintptr(ty) + 1))
+                }
+            }
+        }
+        if base.kind == NODE_INDEX {
+            // Nested array indexing (e.g. field[a][b]): element type of the
+            // inner index's result type.
+            inner_ty := c.InferExprType(base)
+            elem := LlvmArrayElemOrPtr(inner_ty)
+            return elem
+        }
+        if base.kind == NODE_MEMBER {
+            // Field's source type string is "[N]T" (e.g. from the struct table);
+            // parse element source type and map it to LLVM.
+            parent := c.InferStructName(base.left)
+            si := c.FindStruct(parent)
+            if si >= 0 {
+                var fi int = 0
+                for fi < c.struct_field_cnt[si] {
+                    if StrEq(c.struct_field_names[si][fi], base.name) {
+                        fsrc := c.struct_field_types[si][fi]
+                        if uintptr(fsrc) != 0 {
+                            if *((*u8)(uintptr(fsrc))) == u8(91) { // '['
+                                var i usize = 0
+                                for *((*u8)(uintptr(fsrc) + i)) != u8(93) { // ']'
+                                    i += 1
+                                }
+                                return c.TypeStrToLlvm((*i8)(uintptr(fsrc) + i + 1))
+                            }
+                        }
+                        return c.TypeStrToLlvm(fsrc)
+                    }
+                    fi += 1
+                }
+            }
+            // Hardcoded fallback: compiler's own array fields.
+            fty := c.GetFieldType(parent, base.name)
+            if uintptr(fty) != 0 {
+                if *((*u8)(uintptr(fty))) == u8(91) { // '[' — LLVM "[N x T]"
+                    elem := LlvmArrayElem(fty)
+                    return elem
+                }
+            }
+        }
+        // Hardcoded fallbacks for compiler's own array fields
+        var arr_name *i8 = ""
+        if expr.left.kind == NODE_IDENT {
+            arr_name = expr.left.name
+        } else if expr.left.kind == NODE_MEMBER {
+            arr_name = expr.left.name
+        }
+        if StrEq(arr_name, "defers") { return "%struct.Node*" }
+        if StrEq(arr_name, "strings") || StrEq(arr_name, "local_names") || StrEq(arr_name, "local_types") ||
+           StrEq(arr_name, "arg_regs") || StrEq(arr_name, "arg_types") { return "i8*" }
+        if StrEq(arr_name, "arg_is_str") { return "i1" }
+        return "i64"
+    }
+    if expr.kind == NODE_STRUCT_LIT { return c.TypeStrToLlvm(expr.name) }
+    if expr.kind == NODE_UNARY && expr.op == TOK_AMP {
+        if expr.left.kind == NODE_IDENT {
+            ty := c.GetLocalType(expr.left.name)
+            if uintptr(ty) != 0 {
+                buf := malloc(80)
+                sprintf((*u8)(uintptr(buf)), "%s*", c.TypeStrToLlvm(ty))
+                return buf
+            }
+        }
+        if expr.left.kind == NODE_MEMBER {
+            parent := c.InferStructName(expr.left.left)
+            fty := c.GetFieldType(parent, expr.left.name)
+            if uintptr(fty) != 0 {
+                buf := malloc(80)
+                sprintf((*u8)(uintptr(buf)), "%s*", fty)
+                return buf
+            }
+        }
+        return "i8*"
+    }
+    if expr.kind == NODE_UNARY && expr.op == TOK_STAR {
+        inner_ty := c.InferExprType(expr.left)
+        if StrEq(inner_ty, "i8**") { return "i8*" }
+        if StrEq(inner_ty, "%struct.Node**") { return "%struct.Node*" }
+        elem := LlvmStripStar(inner_ty)
+        // Narrow int derefs are emitted widened to i64 (see GenerateExpr TOK_STAR).
+        if StrEq(elem, "i8") || StrEq(elem, "i16") || StrEq(elem, "i32") {
+            return "i64"
+        }
+        return elem
+    }
+    return "i64"
+}
+
+func (c *Codegen) LlvmTypeToTypeStr(llvm_ty *i8) *i8 {
+    if StrEq(llvm_ty, "%struct.Token") { return "Token" }
+    if StrEq(llvm_ty, "%struct.FileData") { return "FileData" }
+    if StrEq(llvm_ty, "%struct.Node*") { return "*Node" }
+    if StrEq(llvm_ty, "%struct.Arena*") { return "*Arena" }
+    if StrEq(llvm_ty, "%struct.Lexer*") { return "*Lexer" }
+    if StrEq(llvm_ty, "%struct.Parser*") { return "*Parser" }
+    if StrEq(llvm_ty, "%struct.Codegen*") { return "*Codegen" }
+    if StrEq(llvm_ty, "i8*") { return "*i8" }
+    if StrEq(llvm_ty, "i8**") { return "**i8" }
+    if StrEq(llvm_ty, "i16*") { return "*u16" }
+    if StrEq(llvm_ty, "i32*") { return "*u32" }
+    if StrEq(llvm_ty, "i64*") { return "*int" }
+    if StrEq(llvm_ty, "i64**") { return "**int" }
+    if StrEq(llvm_ty, "int*") { return "*int" }
+    if StrEq(llvm_ty, "int**") { return "**int" }
+    if StrEq(llvm_ty, "i1") { return "bool" }
+    if StrEq(llvm_ty, "i8") { return "u8" }
+    if StrEq(llvm_ty, "i16") { return "u16" }
+    if StrEq(llvm_ty, "i32") { return "u32" }
+    if StrEq(llvm_ty, "float") { return "f32" }
+    if StrEq(llvm_ty, "double") { return "f64" }
+    if StrStartsWith(llvm_ty, "%struct.") {
+        if *((*u8)(uintptr(llvm_ty) + StrLen(llvm_ty) - 1)) == u8(42) {
+            // "%struct.X*" -> "*X"
+            buf := malloc(64)
+            sprintf((*u8)(uintptr(buf)), "*%s", (*i8)(uintptr(llvm_ty) + 8))
+            *((*u8)(uintptr(buf) + StrLen(buf) - 1)) = u8(0) // strip trailing '*'
+            return buf
+        }
+        // "%struct.X" -> "X"
+        return (*i8)(uintptr(llvm_ty) + 8)
+    }
+    return "int"
+}
+
+func (c *Codegen) IsExprPointer(expr *Node) bool {
+    if uintptr(expr) == 0 { return false }
+    if expr.kind == NODE_STR_LIT { return true }
+    if expr.kind == NODE_IDENT {
+        ty := c.GetLocalType(expr.name)
+        if uintptr(ty) != 0 {
+            if *((*u8)(uintptr(ty))) == u8(42) { return true }
+            if StrEq(ty, "*Node") || StrEq(ty, "*Arena") || StrEq(ty, "*Lexer") ||
+               StrEq(ty, "*Parser") || StrEq(ty, "*Codegen") || StrEq(ty, "*i8") || StrEq(ty, "*u8") || StrEq(ty, "**i8") {
+                return true
+            }
+        }
+        ci := c.FindConst(expr.name)
+        if ci >= 0 && c.const_is_str[ci] { return true }
+        return false
+    }
+    if expr.kind == NODE_MEMBER {
+        struct_name := c.InferStructName(expr.left)
+        f_ty := c.GetFieldType(struct_name, expr.name)
+        if uintptr(f_ty) != 0 {
+            tlen := StrLen(f_ty)
+            if *((*u8)(uintptr(f_ty) + tlen - 1)) == u8(42) { // '*'
+                return true
+            }
+        }
+        return false
+    }
+    if expr.kind == NODE_CALL {
+        if expr.left.kind == NODE_MEMBER {
+            m_ret := c.GetMethodReturnType(c.InferMethodStruct(expr.left.name, expr.left.left), expr.left.name)
+            if StrEq(m_ret, "i8*") || StrEq(m_ret, "%struct.Node*") || StrEq(m_ret, "%struct.Arena*") { return true }
+        } else if expr.left.kind == NODE_IDENT {
+            called_fn := expr.left.name
+            if StrEq(called_fn, "malloc") || StrEq(called_fn, "fopen") || StrEq(called_fn, "AllocNode") { return true }
+        }
+        if expr.left.kind == NODE_UNARY && expr.left.op == TOK_STAR {
+            return true
+        }
+        return false
+    }
+    if expr.kind == NODE_UNARY && expr.op == TOK_AMP {
+        return true
+    }
+    if expr.kind == NODE_UNARY && expr.op == TOK_STAR {
+        inner_ty := c.InferExprType(expr.left)
+        tlen := StrLen(inner_ty)
+        if tlen >= 2 {
+            if *((*u8)(uintptr(inner_ty) + tlen - 1)) == u8(42) {
+                if *((*u8)(uintptr(inner_ty) + tlen - 2)) == u8(42) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+    if expr.kind == NODE_INDEX {
+        idx_ty := c.InferExprType(expr)
+        if StrEq(idx_ty, "i8*") || StrEq(idx_ty, "%struct.Node*") { return true }
+        return false
+    }
+    return false
+}
+
 func (c *Codegen) EmitPreamble() {
     fputs("; ModuleID = 'cez_selfhosted'\n", c.out_fp)
     fputs("target triple = \"x86_64-unknown-linux-gnu\"\n", c.out_fp)
     fputs("target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n\n", c.out_fp)
 
+    // Struct types: fixed definitions for the compiler's own structs (self-build
+    // requires Codegen before its dynamic layout is known), then dynamic ones.
+    fputs("%struct.Arena = type { i8*, i64, i64 }\n", c.out_fp)
+    fputs("%struct.FileData = type { i8*, i64 }\n", c.out_fp)
+    fputs("%struct.Token = type { i64, i64, i64, i64, i8* }\n", c.out_fp)
+    fputs("%struct.Lexer = type { i8*, i64, i64, i64, i64, i64, %struct.Arena* }\n", c.out_fp)
+    fputs("%struct.Parser = type { %struct.Lexer, %struct.Token, %struct.Arena*, i1 }\n", c.out_fp)
+    fputs("%struct.Codegen = type { i8*, i64, i64, i64, [32 x %struct.Node*], i64, [1024 x i8*], i64, [32 x i64], [32 x i64], i8*, i1, i64, [128 x i8*], [128 x i8*], i8*, i64, [64 x i8*], [64 x i1], [64 x i64], [64 x [40 x i8*]], [64 x [40 x i8*]], i64, [128 x i8*], [128 x i8*], [128 x i64], [128 x [8 x i8*]], i64, [128 x i8*], [128 x i1], [128 x i64], [128 x i8*] }\n", c.out_fp)
+    fputs("%struct.Node = type { i64, i64, i64, i8*, i64, i8*, i8*, i1, i64, %struct.Node*, %struct.Node*, %struct.Node*, %struct.Node*, %struct.Node*, %struct.Node*, %struct.Node*, %struct.Node* }\n", c.out_fp)
+
+    var si int = 0
+    for si < c.struct_count {
+        s_name := c.struct_names[si]
+        if !(StrEq(s_name, "Arena") || StrEq(s_name, "FileData") || StrEq(s_name, "Token") ||
+             StrEq(s_name, "Lexer") || StrEq(s_name, "Parser") || StrEq(s_name, "Codegen") ||
+             StrEq(s_name, "Node")) {
+            c.EmitStructType(si)
+        }
+        si += 1
+    }
+    fputs("\n", c.out_fp)
+
     fputs("declare i32 @printf(i8*, ...)\n", c.out_fp)
     fputs("declare i32 @puts(i8*)\n", c.out_fp)
+    fputs("declare i32 @fprintf(i8*, i8*, ...)\n", c.out_fp)
+    fputs("declare i32 @fputs(i8*, i8*)\n", c.out_fp)
     fputs("declare i8* @malloc(i64)\n", c.out_fp)
     fputs("declare void @free(i8*)\n", c.out_fp)
     fputs("declare i8* @fopen(i8*, i8*)\n", c.out_fp)
@@ -85,13 +1068,69 @@ func (c *Codegen) EmitPreamble() {
     fputs("declare i64 @fwrite(i8*, i64, i64, i8*)\n", c.out_fp)
     fputs("declare i32 @fseek(i8*, i64, i32)\n", c.out_fp)
     fputs("declare i64 @ftell(i8*)\n", c.out_fp)
-    fputs("declare i32 @system(i8*)\n\n", c.out_fp)
+    fputs("declare i32 @system(i8*)\n", c.out_fp)
+    fputs("declare i32 @sprintf(i8*, i8*, ...)\n", c.out_fp)
+    fputs("declare i8* @memcpy(i8*, i8*, i64)\n", c.out_fp)
+    fputs("declare i8* @memset(i8*, i32, i64)\n", c.out_fp)
+    fputs("declare i8* @getenv(i8*)\n\n", c.out_fp)
+}
+
+func (c *Codegen) EmitEscapedString(s *i8) {
+    var idx usize = 0
+    for {
+        b := *((*u8)(uintptr(s) + idx))
+        if b == u8(0) {
+            break
+        }
+        if b == u8(92) { // '\\'
+            fputs("\\5C", c.out_fp)
+        } else if b == u8(34) { // '"'
+            fputs("\\22", c.out_fp)
+        } else if b == u8(10) { // '\n'
+            fputs("\\0A", c.out_fp)
+        } else if b == u8(13) { // '\r'
+            fputs("\\0D", c.out_fp)
+        } else if b == u8(9) { // '\t'
+            fputs("\\09", c.out_fp)
+        } else if b < u8(32) || b >= u8(127) {
+            fprintf(c.out_fp, "\\%02X", int(b))
+        } else {
+            fprintf(c.out_fp, "%c", int(b))
+        }
+        idx += 1
+    }
 }
 
 func (c *Codegen) Generate(root *Node) {
+    c.ScanTypes(root)
     c.EmitPreamble()
 
+    // Pass 1: Global constants and variables
     curr := root.body
+    for uintptr(curr) != 0 {
+        if curr.kind == NODE_CONST {
+            ci := c.FindConst(curr.name)
+            if ci >= 0 && c.const_is_str[ci] {
+                sid := c.InternString(c.const_strs[ci])
+                slen := int(StrLen(c.const_strs[ci]) + 1)
+                fprintf(c.out_fp, "@%s = private constant i8* getelementptr inbounds ([%d x i8], [%d x i8]* @.str.%d, i64 0, i64 0)\n",
+                        curr.name, slen, slen, sid)
+            } else if ci >= 0 {
+                var llvm_ty *i8 = "i64"
+                if uintptr(curr.type_str) != 0 {
+                    llvm_ty = c.TypeStrToLlvm(curr.type_str)
+                }
+                fprintf(c.out_fp, "@%s = constant %s %ld\n", curr.name, llvm_ty, c.const_ints[ci])
+            }
+        } else if curr.kind == NODE_GLOBAL_VAR {
+            c.EmitGlobalVar(curr)
+        }
+        curr = curr.next
+    }
+    fputs("\n", c.out_fp)
+
+    // Pass 2: Functions
+    curr = root.body
     for uintptr(curr) != 0 {
         if curr.kind == NODE_FUNC && uintptr(curr.body) != 0 {
             c.GenerateFunc(curr)
@@ -99,25 +1138,110 @@ func (c *Codegen) Generate(root *Node) {
         curr = curr.next
     }
 
+    // Pass 3: String literals table
     var s_idx int = 0
     for s_idx < c.str_count {
         s_val := c.strings[s_idx]
         s_len := StrLen(s_val) + 1
-        fprintf(c.out_fp, "@.str.%d = private unnamed_addr constant [%lu x i8] c\"%s\\00\", align 1\n", s_idx, s_len, s_val)
+        fprintf(c.out_fp, "@.str.%d = private unnamed_addr constant [%lu x i8] c\"", s_idx, s_len)
+        c.EmitEscapedString(s_val)
+        fputs("\\00\", align 1\n", c.out_fp)
         s_idx += 1
+    }
+}
+
+func (c *Codegen) ScanVarDecl(stmt *Node) {
+    if uintptr(stmt) == 0 {
+        return
+    }
+
+    if stmt.kind == NODE_VAR_DECL {
+        if !c.IsLocal(stmt.name) {
+            var llvm_ty *i8 = "i64"
+            var ty_str *i8 = "i64"
+            if uintptr(stmt.type_str) != 0 {
+                ty_str = stmt.type_str
+                if IsBuiltinTypeStr(stmt.type_str) || *((*u8)(uintptr(stmt.type_str))) == u8(42) ||
+                   *((*u8)(uintptr(stmt.type_str))) == u8(91) {
+                    llvm_ty = c.TypeStrToLlvm(stmt.type_str)
+                } else if c.FindStruct(stmt.type_str) >= 0 {
+                    llvm_ty = c.TypeStrToLlvm(stmt.type_str)
+                } else if uintptr(stmt.init) != 0 && stmt.init.kind == NODE_STRUCT_LIT {
+                    // Unknown declared type; the literal's own struct table entry
+                    // provides the LLVM type.
+                    llvm_ty = c.TypeStrToLlvm(stmt.init.name)
+                    ty_str = stmt.init.name
+                } else {
+                    // Unknown named type: treat as i64.
+                    ty_str = stmt.type_str
+                }
+            } else if uintptr(stmt.init) != 0 {
+                if stmt.init.kind == NODE_STRUCT_LIT {
+                    llvm_ty = c.TypeStrToLlvm(stmt.init.name)
+                    ty_str = stmt.init.name
+                } else {
+                    llvm_ty = c.InferExprType(stmt.init)
+                    ty_str = c.LlvmTypeToTypeStr(llvm_ty)
+                }
+            }
+            c.AddLocal(stmt.name, ty_str)
+            fprintf(c.out_fp, "  %%%s = alloca %s, align 8\n", stmt.name, llvm_ty)
+        }
+    } else if stmt.kind == NODE_BLOCK {
+        s := stmt.body
+        for uintptr(s) != 0 {
+            c.ScanVarDecl(s)
+            s = s.next
+        }
+    } else if stmt.kind == NODE_IF {
+        if uintptr(stmt.body) != 0 {
+            s := stmt.body.body
+            for uintptr(s) != 0 {
+                c.ScanVarDecl(s)
+                s = s.next
+            }
+        }
+        if uintptr(stmt.right) != 0 {
+            if stmt.right.kind == NODE_IF {
+                c.ScanVarDecl(stmt.right)
+            } else if stmt.right.kind == NODE_BLOCK {
+                s := stmt.right.body
+                for uintptr(s) != 0 {
+                    c.ScanVarDecl(s)
+                    s = s.next
+                }
+            }
+        }
+    } else if stmt.kind == NODE_FOR {
+        if uintptr(stmt.init) != 0 {
+            c.ScanVarDecl(stmt.init)
+        }
+        if uintptr(stmt.body) != 0 {
+            s := stmt.body.body
+            for uintptr(s) != 0 {
+                c.ScanVarDecl(s)
+                s = s.next
+            }
+        }
     }
 }
 
 func (c *Codegen) GenerateFunc(f *Node) {
     c.reg_id = 1
     c.defer_count = 0
+    c.local_count = 0
     c.current_func_name = f.name
     c.func_returned = false
 
-    ret_ty := "i64"
+    var ret_ty *i8 = "i64"
     if StrEq(f.name, "main") {
         ret_ty = "i32"
+    } else if uintptr(f.type_str) != 0 {
+        ret_ty = c.TypeStrToLlvm(f.type_str)
+    } else {
+        ret_ty = "void"
     }
+    c.func_ret_ty = ret_ty
 
     fprintf(c.out_fp, "define %s @%s(", ret_ty, f.name)
     p_node := f.args
@@ -126,7 +1250,12 @@ func (c *Codegen) GenerateFunc(f *Node) {
         if p_idx > 0 {
             fputs(", ", c.out_fp)
         }
-        fprintf(c.out_fp, "i64 %%arg.%s", p_node.name)
+        var p_ty *i8 = "i64"
+        if uintptr(p_node.type_str) != 0 {
+            p_ty = c.TypeStrToLlvm(p_node.type_str)
+        }
+        fprintf(c.out_fp, "%s %%arg.%s", p_ty, p_node.name)
+        c.AddLocal(p_node.name, p_node.type_str)
         p_idx += 1
         p_node = p_node.next
     }
@@ -139,9 +1268,22 @@ func (c *Codegen) GenerateFunc(f *Node) {
     // Store parameters into allocas
     p_node = f.args
     for uintptr(p_node) != 0 {
-        fprintf(c.out_fp, "  %%%s = alloca i64, align 8\n", p_node.name)
-        fprintf(c.out_fp, "  store i64 %%arg.%s, i64* %%%s, align 8\n", p_node.name, p_node.name)
+        var p_ty *i8 = "i64"
+        if uintptr(p_node.type_str) != 0 {
+            p_ty = c.TypeStrToLlvm(p_node.type_str)
+        }
+        fprintf(c.out_fp, "  %%%s = alloca %s, align 8\n", p_node.name, p_ty)
+        fprintf(c.out_fp, "  store %s %%arg.%s, %s* %%%s, align 8\n", p_ty, p_node.name, p_ty, p_node.name)
         p_node = p_node.next
+    }
+
+    // Pre-scan and emit allocas for all local variables in entry block
+    if uintptr(f.body) != 0 {
+        s := f.body.body
+        for uintptr(s) != 0 {
+            c.ScanVarDecl(s)
+            s = s.next
+        }
     }
 
     // Body
@@ -157,6 +1299,16 @@ func (c *Codegen) GenerateFunc(f *Node) {
         c.ExecuteDefers()
         if StrEq(f.name, "main") {
             fputs("  ret i32 0\n", c.out_fp)
+        } else if StrEq(ret_ty, "void") {
+            fputs("  ret void\n", c.out_fp)
+        } else if StrEq(ret_ty, "%struct.Token") {
+            fputs("  ret %struct.Token zeroinitializer\n", c.out_fp)
+        } else if StrEq(ret_ty, "%struct.FileData") {
+            fputs("  ret %struct.FileData zeroinitializer\n", c.out_fp)
+        } else if StrEq(ret_ty, "i8*") || StrEq(ret_ty, "%struct.Node*") || StrEq(ret_ty, "i8**") {
+            fputs("  ret ptr null\n", c.out_fp)
+        } else if StrEq(ret_ty, "i1") {
+            fputs("  ret i1 false\n", c.out_fp)
         } else {
             fputs("  ret i64 0\n", c.out_fp)
         }
@@ -174,35 +1326,283 @@ func (c *Codegen) ExecuteDefers() {
     c.defer_count = 0
 }
 
+func (c *Codegen) GenerateExprPtr(expr *Node) *i8 {
+    if expr.kind == NODE_IDENT {
+        buf := malloc(64)
+        if c.IsLocal(expr.name) {
+            sprintf(buf, "%s", expr.name)
+        } else {
+            sprintf(buf, "@%s", expr.name)
+        }
+        return (*i8)(uintptr(buf))
+    }
+
+    if expr.kind == NODE_MEMBER {
+        target := expr.left
+        field_name := expr.name
+        struct_name := c.InferStructName(target)
+        field_idx := c.GetFieldIdx(struct_name, field_name)
+
+        var t_ptr *i8 = (*i8)(uintptr(0))
+        if target.kind == NODE_IDENT {
+            t_ty := c.GetLocalType(target.name)
+            var is_ptr bool = false
+            if uintptr(t_ty) != 0 {
+                if *((*u8)(uintptr(t_ty))) == u8(42) { // '*'
+                    is_ptr = true
+                }
+            }
+            if is_ptr {
+                t_ptr = c.GenerateExpr(target)
+            } else {
+                t_ptr = target.name
+            }
+        } else if target.kind == NODE_MEMBER {
+            inner_ptr := c.GenerateExprPtr(target)
+            field_ty := c.GetFieldType(c.InferStructName(target.left), target.name)
+            // GetFieldType returns an LLVM type string: pointer-typed fields end
+            // with '*' (e.g. "%struct.Node*", "i8*") and need a load so the next
+            // GEP starts from the field's value; embedded struct fields
+            // (e.g. "%struct.Token") already give a valid base pointer.
+            var needs_load bool = false
+            if uintptr(field_ty) != 0 && StrLen(field_ty) > 0 {
+                if *((*u8)(uintptr(field_ty) + StrLen(field_ty) - 1)) == u8(42) { // '*'
+                    needs_load = true
+                }
+            }
+            if needs_load {
+                load_reg := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = load %s, %s* %%%s, align 8\n", load_reg, field_ty, field_ty, inner_ptr)
+                buf2 := malloc(32)
+                sprintf(buf2, "r%d", load_reg)
+                t_ptr = (*i8)(uintptr(buf2))
+            } else {
+                t_ptr = inner_ptr
+            }
+        } else {
+            val_reg := c.GenerateExpr(target)
+            tmp_reg := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = alloca %%struct.%s, align 8\n", tmp_reg, struct_name)
+            fprintf(c.out_fp, "  store %%struct.%s %%%s, %%struct.%s* %%r%d, align 8\n",
+                    struct_name, val_reg, struct_name, tmp_reg)
+            buf := malloc(32)
+            sprintf(buf, "r%d", tmp_reg)
+            t_ptr = (*i8)(uintptr(buf))
+        }
+
+        gep_reg := c.NewReg()
+        fprintf(c.out_fp, "  %%r%d = getelementptr inbounds %%struct.%s, %%struct.%s* %%%s, i32 0, i32 %d\n",
+                gep_reg, struct_name, struct_name, t_ptr, field_idx)
+        buf := malloc(32)
+        sprintf(buf, "r%d", gep_reg)
+        return (*i8)(uintptr(buf))
+    }
+
+    if expr.kind == NODE_INDEX {
+        target_reg := c.GenerateExprPtr(expr.left)
+        idx_reg := c.GenerateExpr(expr.right)
+        elem_ty := c.InferExprType(expr)
+        gep_reg := c.NewReg()
+        var pfx *i8 = "%"
+        if *((*u8)(uintptr(target_reg))) == u8(64) { // '@'
+            pfx = ""
+        }
+        fprintf(c.out_fp, "  %%r%d = getelementptr inbounds %s, %s* %s%s, i64 %%%s\n",
+                gep_reg, elem_ty, elem_ty, pfx, target_reg, idx_reg)
+        buf := malloc(32)
+        sprintf(buf, "r%d", gep_reg)
+        return (*i8)(uintptr(buf))
+    }
+
+    if expr.kind == NODE_UNARY && expr.op == TOK_STAR {
+        ptr_reg := c.GenerateExpr(expr.left)
+        if c.IsExprPointer(expr.left) {
+            return ptr_reg
+        }
+        cast_reg := c.NewReg()
+        fprintf(c.out_fp, "  %%r%d = inttoptr i64 %%%s to i8*\n", cast_reg, ptr_reg)
+        buf := malloc(32)
+        sprintf(buf, "r%d", cast_reg)
+        return (*i8)(uintptr(buf))
+    }
+
+    return (*i8)(uintptr(0))
+}
+
+// EmitStoreCast converts a register holding a value of src_ty (i64 from
+// expression evaluation) into a register suitable for storing into dst_ty.
+// Returns the register name and the LLVM type of the converted value.
+// Pointers are byte-identical in registers, so they pass through unchanged.
+func (c *Codegen) EmitStoreCast(val_reg *i8, dst_ty *i8, src_ty *i8) *i8 {
+    if StrEq(dst_ty, src_ty) || StrStartsWith(dst_ty, "%struct.") {
+        return val_reg
+    }
+    if StrEq(dst_ty, "i1") {
+        return val_reg // bools are produced as i1 already
+    }
+    if StrEq(dst_ty, "i8") {
+        r := c.NewReg()
+        if StrEq(src_ty, "i64") {
+            fprintf(c.out_fp, "  %%r%d = trunc i64 %%%s to i8\n", r, val_reg)
+        } else {
+            fprintf(c.out_fp, "  %%r%d = trunc i32 %%%s to i8\n", r, val_reg)
+        }
+        buf := malloc(32)
+        sprintf((*u8)(uintptr(buf)), "r%d", r)
+        return (*i8)(uintptr(buf))
+    }
+    if StrEq(dst_ty, "i16") {
+        r := c.NewReg()
+        if StrEq(src_ty, "i64") {
+            fprintf(c.out_fp, "  %%r%d = trunc i64 %%%s to i16\n", r, val_reg)
+        } else {
+            fprintf(c.out_fp, "  %%r%d = trunc i32 %%%s to i16\n", r, val_reg)
+        }
+        buf := malloc(32)
+        sprintf((*u8)(uintptr(buf)), "r%d", r)
+        return (*i8)(uintptr(buf))
+    }
+    if StrEq(dst_ty, "i32") {
+        r := c.NewReg()
+        if StrEq(src_ty, "i64") {
+            fprintf(c.out_fp, "  %%r%d = trunc i64 %%%s to i32\n", r, val_reg)
+        }
+        buf := malloc(32)
+        sprintf((*u8)(uintptr(buf)), "r%d", r)
+        return (*i8)(uintptr(buf))
+    }
+    return val_reg
+}
+
 func (c *Codegen) GenerateStmt(stmt *Node) {
     if stmt.kind == NODE_VAR_DECL {
-        // alloca
-        fprintf(c.out_fp, "  %%%s = alloca i64, align 8\n", stmt.name)
         if uintptr(stmt.init) != 0 {
             val_reg := c.GenerateExpr(stmt.init)
-            fprintf(c.out_fp, "  store i64 %%%s, i64* %%%s, align 8\n", val_reg, stmt.name)
+            var dst_ty *i8 = "i64"
+            var src_ty *i8 = c.InferExprType(stmt.init)
+            if stmt.init.kind == NODE_STRUCT_LIT {
+                if uintptr(stmt.type_str) != 0 {
+                    dst_ty = c.TypeStrToLlvm(stmt.type_str)
+                } else {
+                    dst_ty = c.TypeStrToLlvm(stmt.init.name)
+                }
+                src_ty = dst_ty
+            } else {
+                ty_str := c.GetLocalType(stmt.name)
+                if uintptr(ty_str) != 0 {
+                    dst_ty = c.TypeStrToLlvm(ty_str)
+                }
+            }
+            if stmt.init.kind == NODE_STRUCT_LIT {
+                // Struct values already have the right type from GenerateExpr.
+                fprintf(c.out_fp, "  store %s %%%s, %s* %%%s, align 8\n", dst_ty, val_reg, dst_ty, stmt.name)
+            } else {
+                cast_reg := c.EmitStoreCast(val_reg, dst_ty, src_ty)
+                fprintf(c.out_fp, "  store %s %%%s, %s* %%%s, align 8\n", dst_ty, cast_reg, dst_ty, stmt.name)
+            }
         }
     } else if stmt.kind == NODE_ASSIGN {
         val_reg := c.GenerateExpr(stmt.right)
-        target_name := stmt.left.name
-        if stmt.op == TOK_PLUS_ASSIGN {
-            cur_reg := c.NewReg()
-            add_reg := c.NewReg()
-            fprintf(c.out_fp, "  %%r%d = load i64, i64* %%%s, align 8\n", cur_reg, target_name)
-            fprintf(c.out_fp, "  %%r%d = add i64 %%r%d, %%%s\n", add_reg, cur_reg, val_reg)
-            val_reg_name := malloc(32)
-            sprintf(val_reg_name, "r%d", add_reg)
-            fprintf(c.out_fp, "  store i64 %%%s, i64* %%%s, align 8\n", (*i8)(uintptr(val_reg_name)), target_name)
-        } else if stmt.op == TOK_MINUS_ASSIGN {
-            cur_reg := c.NewReg()
-            sub_reg := c.NewReg()
-            fprintf(c.out_fp, "  %%r%d = load i64, i64* %%%s, align 8\n", cur_reg, target_name)
-            fprintf(c.out_fp, "  %%r%d = sub i64 %%r%d, %%%s\n", sub_reg, cur_reg, val_reg)
-            val_reg_name := malloc(32)
-            sprintf(val_reg_name, "r%d", sub_reg)
-            fprintf(c.out_fp, "  store i64 %%%s, i64* %%%s, align 8\n", (*i8)(uintptr(val_reg_name)), target_name)
-        } else {
-            fprintf(c.out_fp, "  store i64 %%%s, i64* %%%s, align 8\n", val_reg, target_name)
+        if stmt.left.kind == NODE_IDENT {
+            target_name := stmt.left.name
+            is_loc := c.IsLocal(target_name)
+            var pfx *i8 = "%"
+            if !is_loc {
+                pfx = "@"
+            }
+            if stmt.op == TOK_PLUS_ASSIGN {
+                cur_reg := c.NewReg()
+                add_reg := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = load i64, i64* %s%s, align 8\n", cur_reg, pfx, target_name)
+                fprintf(c.out_fp, "  %%r%d = add i64 %%r%d, %%%s\n", add_reg, cur_reg, val_reg)
+                fprintf(c.out_fp, "  store i64 %%r%d, i64* %s%s, align 8\n", add_reg, pfx, target_name)
+            } else if stmt.op == TOK_MINUS_ASSIGN {
+                cur_reg := c.NewReg()
+                sub_reg := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = load i64, i64* %s%s, align 8\n", cur_reg, pfx, target_name)
+                fprintf(c.out_fp, "  %%r%d = sub i64 %%r%d, %%%s\n", sub_reg, cur_reg, val_reg)
+                fprintf(c.out_fp, "  store i64 %%r%d, i64* %s%s, align 8\n", sub_reg, pfx, target_name)
+            } else {
+                ty := c.GetLocalType(target_name)
+                var dst_ty *i8 = "i64"
+                if uintptr(ty) != 0 {
+                    dst_ty = c.TypeStrToLlvm(ty)
+                }
+                src_ty := c.InferExprType(stmt.right)
+                cast_reg := c.EmitStoreCast(val_reg, dst_ty, src_ty)
+                var align int = 8
+                if StrEq(dst_ty, "i8") { align = 1 }
+                if StrEq(dst_ty, "i16") { align = 2 }
+                if StrEq(dst_ty, "i32") { align = 4 }
+                if StrEq(dst_ty, "i1") { align = 1 }
+                fprintf(c.out_fp, "  store %s %%%s, %s* %s%s, align %d\n", dst_ty, cast_reg, dst_ty, pfx, target_name, align)
+            }
+        } else if stmt.left.kind == NODE_MEMBER {
+            target_ptr := c.GenerateExprPtr(stmt.left)
+            struct_name := c.InferStructName(stmt.left.left)
+            field_ty := c.GetFieldType(struct_name, stmt.left.name)
+            if stmt.op == TOK_PLUS_ASSIGN {
+                cur_reg := c.NewReg()
+                add_reg := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = load i64, i64* %%%s, align 8\n", cur_reg, target_ptr)
+                fprintf(c.out_fp, "  %%r%d = add i64 %%r%d, %%%s\n", add_reg, cur_reg, val_reg)
+                fprintf(c.out_fp, "  store i64 %%r%d, i64* %%%s, align 8\n", add_reg, target_ptr)
+            } else if stmt.op == TOK_MINUS_ASSIGN {
+                cur_reg := c.NewReg()
+                sub_reg := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = load i64, i64* %%%s, align 8\n", cur_reg, target_ptr)
+                fprintf(c.out_fp, "  %%r%d = sub i64 %%r%d, %%%s\n", sub_reg, cur_reg, val_reg)
+                fprintf(c.out_fp, "  store i64 %%r%d, i64* %%%s, align 8\n", sub_reg, target_ptr)
+            } else if StrEq(field_ty, "i8") || StrEq(field_ty, "i16") || StrEq(field_ty, "i32") ||
+                      StrEq(field_ty, "i1") || StrStartsWith(field_ty, "%struct.") {
+                // Narrow or struct-typed field: value already has the right type
+                // from expression evaluation (structs pass through, i8/i1 come
+                // from member loads with zext, bools from icmp).
+                if StrStartsWith(field_ty, "%struct.") {
+                    fprintf(c.out_fp, "  store %s %%%s, %s* %%%s, align 8\n", field_ty, val_reg, field_ty, target_ptr)
+                } else {
+                    src_ty := c.InferExprType(stmt.right)
+                    cast_reg := c.EmitStoreCast(val_reg, field_ty, src_ty)
+                    fprintf(c.out_fp, "  store %s %%%s, %s* %%%s, align 8\n", field_ty, cast_reg, field_ty, target_ptr)
+                }
+            } else {
+                fprintf(c.out_fp, "  store %s %%%s, %s* %%%s, align 8\n", field_ty, val_reg, field_ty, target_ptr)
+            }
+        } else if stmt.left.kind == NODE_INDEX {
+            target_ptr := c.GenerateExprPtr(stmt.left)
+            elem_ty := c.InferExprType(stmt.left)
+            var store_reg *i8 = val_reg
+            if StrEq(elem_ty, "i8") || StrEq(elem_ty, "i16") || StrEq(elem_ty, "i32") {
+                store_reg = c.EmitStoreCast(val_reg, elem_ty, "i64")
+            }
+            var align int = 8
+            if StrEq(elem_ty, "i8") || StrEq(elem_ty, "i1") { align = 1 }
+            if StrEq(elem_ty, "i16") { align = 2 }
+            if StrEq(elem_ty, "i32") { align = 4 }
+            fprintf(c.out_fp, "  store %s %%%s, %s* %%%s, align %d\n", elem_ty, store_reg, elem_ty, target_ptr, align)
+        } else if stmt.left.kind == NODE_UNARY && stmt.left.op == TOK_STAR {
+            ptr_reg := c.GenerateExpr(stmt.left.left)
+            ptr_ty := c.InferExprType(stmt.left.left)
+            var cast_reg *i8 = ptr_reg
+            if !c.IsExprPointer(stmt.left.left) {
+                r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = inttoptr i64 %%%s to i8*\n", r, ptr_reg)
+                buf := malloc(32)
+                sprintf(buf, "r%d", r)
+                cast_reg = (*i8)(uintptr(buf))
+                ptr_ty = "i8*"
+            }
+            elem_ty := LlvmStripStar(ptr_ty)
+            val_ty := c.InferExprType(stmt.right)
+            var store_reg *i8 = val_reg
+            if StrEq(elem_ty, "i8") || StrEq(elem_ty, "i16") || StrEq(elem_ty, "i32") {
+                store_reg = c.EmitStoreCast(val_reg, elem_ty, "i64")
+            }
+            var align int = 8
+            if StrEq(elem_ty, "i8") || StrEq(elem_ty, "i1") { align = 1 }
+            if StrEq(elem_ty, "i16") { align = 2 }
+            if StrEq(elem_ty, "i32") { align = 4 }
+            fprintf(c.out_fp, "  store %s %%%s, %s %%%s, align %d\n", elem_ty, store_reg, ptr_ty, cast_reg, align)
         }
     } else if stmt.kind == NODE_RETURN {
         var ret_reg *i8 = "0"
@@ -211,10 +1611,20 @@ func (c *Codegen) GenerateStmt(stmt *Node) {
         }
         c.ExecuteDefers()
         if StrEq(c.current_func_name, "main") {
-            fprintf(c.out_fp, "  %%ret.trunc = trunc i64 %%%s to i32\n", ret_reg)
-            fprintf(c.out_fp, "  ret i32 %%ret.trunc\n")
+            trunc_r := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = trunc i64 %%%s to i32\n", trunc_r, ret_reg)
+            fprintf(c.out_fp, "  ret i32 %%r%d\n", trunc_r)
+        } else if StrEq(c.func_ret_ty, "void") || (StrEq(ret_reg, "0") && uintptr(stmt.left) == 0) {
+            fputs("  ret void\n", c.out_fp)
+        } else if (StrEq(c.func_ret_ty, "i8*") || StrEq(c.func_ret_ty, "%struct.Node*") || StrEq(c.func_ret_ty, "i8**")) &&
+                   uintptr(stmt.left) != 0 && stmt.left.kind == NODE_INT_LIT && stmt.left.int_val == 0 {
+            fprintf(c.out_fp, "  ret %s null\n", c.func_ret_ty)
+        } else if StrEq(c.func_ret_ty, "i8") {
+            trunc_reg := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = trunc i64 %%%s to i8\n", trunc_reg, ret_reg)
+            fprintf(c.out_fp, "  ret i8 %%r%d\n", trunc_reg)
         } else {
-            fprintf(c.out_fp, "  ret i64 %%%s\n", ret_reg)
+            fprintf(c.out_fp, "  ret %s %%%s\n", c.func_ret_ty, ret_reg)
         }
         c.func_returned = true
     } else if stmt.kind == NODE_DEFER {
@@ -222,6 +1632,29 @@ func (c *Codegen) GenerateStmt(stmt *Node) {
             c.defers[c.defer_count] = stmt.left
             c.defer_count += 1
         }
+    } else if stmt.kind == NODE_VOLATILE_STORE {
+        // @volatile_store(ptr, val)
+        ptr_reg := c.GenerateExpr(stmt.left)
+        val_reg := c.GenerateExpr(stmt.right)
+        ptr_ty := c.InferExprType(stmt.left)
+        elem_ty := LlvmStripStar(ptr_ty)
+        val_ty := c.InferExprType(stmt.right)
+        var cast_reg *i8 = val_reg
+        if StrEq(val_ty, "i64") && !StrEq(elem_ty, "i64") && !StrStartsWith(elem_ty, "%struct.") {
+            cast_reg = c.EmitStoreCast(val_reg, elem_ty, "i64")
+        }
+        var align int = 8
+        if StrEq(elem_ty, "i8") || StrEq(elem_ty, "i1") { align = 1 }
+        if StrEq(elem_ty, "i16") { align = 2 }
+        if StrEq(elem_ty, "i32") { align = 4 }
+        fprintf(c.out_fp, "  store volatile %s %%%s, %s* %%%s, align %d\n", elem_ty, cast_reg, ptr_ty, ptr_reg, align)
+    } else if stmt.kind == NODE_VOLATILE_LOAD {
+        // @volatile_load(ptr) — result discarded
+        ptr_reg := c.GenerateExpr(stmt.left)
+        ptr_ty := c.InferExprType(stmt.left)
+        elem_ty := LlvmStripStar(ptr_ty)
+        r := c.NewReg()
+        fprintf(c.out_fp, "  %%r%d = load volatile %s, %s* %%%s, align 8\n", r, elem_ty, ptr_ty, ptr_reg)
     } else if stmt.kind == NODE_IF {
         cond_reg := c.GenerateExpr(stmt.cond)
         lbl_then := c.NewLabel()
@@ -237,25 +1670,36 @@ func (c *Codegen) GenerateStmt(stmt *Node) {
 
         // Then
         fprintf(c.out_fp, "lbl.%d:\n", lbl_then)
+        c.func_returned = false
         then_stmt := stmt.body.body
         for uintptr(then_stmt) != 0 {
             c.GenerateStmt(then_stmt)
             then_stmt = then_stmt.next
         }
-        fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_end)
+        if !c.func_returned {
+            fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_end)
+        }
 
         // Else
         if uintptr(stmt.right) != 0 {
             fprintf(c.out_fp, "lbl.%d:\n", lbl_else)
-            else_stmt := stmt.right.body
-            for uintptr(else_stmt) != 0 {
-                c.GenerateStmt(else_stmt)
-                else_stmt = else_stmt.next
+            c.func_returned = false
+            if stmt.right.kind == NODE_IF {
+                c.GenerateStmt(stmt.right)
+            } else if stmt.right.kind == NODE_BLOCK {
+                else_stmt := stmt.right.body
+                for uintptr(else_stmt) != 0 {
+                    c.GenerateStmt(else_stmt)
+                    else_stmt = else_stmt.next
+                }
             }
-            fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_end)
+            if !c.func_returned {
+                fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_end)
+            }
         }
 
         fprintf(c.out_fp, "lbl.%d:\n", lbl_end)
+        c.func_returned = false
     } else if stmt.kind == NODE_FOR {
         lbl_cond := c.NewLabel()
         lbl_body := c.NewLabel()
@@ -270,6 +1714,7 @@ func (c *Codegen) GenerateStmt(stmt *Node) {
 
         // Cond
         fprintf(c.out_fp, "lbl.%d:\n", lbl_cond)
+        c.func_returned = false
         if uintptr(stmt.cond) != 0 {
             cond_reg := c.GenerateExpr(stmt.cond)
             fprintf(c.out_fp, "  br i1 %%%s, label %%lbl.%d, label %%lbl.%d\n", cond_reg, lbl_body, lbl_exit)
@@ -281,6 +1726,7 @@ func (c *Codegen) GenerateStmt(stmt *Node) {
 
         // Body
         fprintf(c.out_fp, "lbl.%d:\n", lbl_body)
+        c.func_returned = false
         if uintptr(stmt.body) != 0 {
             body_stmt := stmt.body.body
             for uintptr(body_stmt) != 0 {
@@ -289,17 +1735,23 @@ func (c *Codegen) GenerateStmt(stmt *Node) {
             }
         }
         c.PopLoop()
-        fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_post)
+        if !c.func_returned {
+            fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_post)
+        }
 
         // Post
         fprintf(c.out_fp, "lbl.%d:\n", lbl_post)
+        c.func_returned = false
         if uintptr(stmt.post) != 0 {
             c.GenerateStmt(stmt.post)
         }
-        fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_cond)
+        if !c.func_returned {
+            fprintf(c.out_fp, "  br label %%lbl.%d\n", lbl_cond)
+        }
 
         // Exit
         fprintf(c.out_fp, "lbl.%d:\n", lbl_exit)
+        c.func_returned = false
     } else if stmt.kind == NODE_BREAK {
         exit_lbl := c.GetLoopExit()
         fprintf(c.out_fp, "  br label %%lbl.%d\n", exit_lbl)
@@ -312,6 +1764,10 @@ func (c *Codegen) GenerateStmt(stmt *Node) {
 }
 
 func (c *Codegen) GenerateExpr(expr *Node) *i8 {
+    if expr.kind == NODE_EXPR_STMT {
+        return c.GenerateExpr(expr.left)
+    }
+
     if expr.kind == NODE_INT_LIT {
         r := c.NewReg()
         fprintf(c.out_fp, "  %%r%d = add i64 0, %ld\n", r, expr.int_val)
@@ -320,34 +1776,141 @@ func (c *Codegen) GenerateExpr(expr *Node) *i8 {
         return (*i8)(uintptr(buf))
     }
 
-    if expr.kind == NODE_IDENT {
+    if expr.kind == NODE_FLOAT_LIT {
         r := c.NewReg()
-        fprintf(c.out_fp, "  %%r%d = load i64, i64* %%%s, align 8\n", r, expr.name)
+        fprintf(c.out_fp, "  %%r%d = fadd double 0.0, %s\n", r, expr.str_val)
         buf := malloc(32)
         sprintf(buf, "r%d", r)
         return (*i8)(uintptr(buf))
     }
 
+    if expr.kind == NODE_IDENT {
+        if StrEq(expr.name, "true") {
+            r := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = add i1 0, 1\n", r)
+            buf := malloc(32)
+            sprintf(buf, "r%d", r)
+            return (*i8)(uintptr(buf))
+        }
+        if StrEq(expr.name, "false") {
+            r := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = add i1 0, 0\n", r)
+            buf := malloc(32)
+            sprintf(buf, "r%d", r)
+            return (*i8)(uintptr(buf))
+        }
+        if StrEq(expr.name, "nil") {
+            r := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = add i64 0, 0\n", r)
+            buf := malloc(32)
+            sprintf(buf, "r%d", r)
+            return (*i8)(uintptr(buf))
+        }
+
+        r := c.NewReg()
+        if c.IsLocal(expr.name) {
+            ty := c.GetLocalType(expr.name)
+            var llvm_ty *i8 = "i64"
+            if uintptr(ty) != 0 {
+                llvm_ty = c.TypeStrToLlvm(ty)
+            }
+            if StrEq(llvm_ty, "i8") {
+                load_r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = load i8, i8* %%%s, align 1\n", load_r, expr.name)
+                fprintf(c.out_fp, "  %%r%d = zext i8 %%r%d to i64\n", r, load_r)
+            } else if StrEq(llvm_ty, "i16") {
+                load_r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = load i16, i16* %%%s, align 2\n", load_r, expr.name)
+                fprintf(c.out_fp, "  %%r%d = zext i16 %%r%d to i64\n", r, load_r)
+            } else if StrEq(llvm_ty, "i32") {
+                load_r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = load i32, i32* %%%s, align 4\n", load_r, expr.name)
+                fprintf(c.out_fp, "  %%r%d = zext i32 %%r%d to i64\n", r, load_r)
+            } else if StrEq(llvm_ty, "i1") {
+                // Bool loads stay i1: conditions and ! expect i1 registers.
+                load_r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = load i1, i1* %%%s, align 1\n", load_r, expr.name)
+                buf := malloc(32)
+                sprintf((*u8)(uintptr(buf)), "r%d", load_r)
+                return (*i8)(uintptr(buf))
+            } else {
+                fprintf(c.out_fp, "  %%r%d = load %s, %s* %%%s, align 8\n", r, llvm_ty, llvm_ty, expr.name)
+            }
+        } else {
+            // Global variable or constant: load with declared type when known.
+            var g_ty *i8 = "i64"
+            ci := c.FindConst(expr.name)
+            if ci >= 0 && c.const_is_str[ci] {
+                g_ty = "i8*"
+            }
+            fprintf(c.out_fp, "  %%r%d = load %s, %s* @%s, align 8\n", r, g_ty, g_ty, expr.name)
+        }
+        buf := malloc(32)
+        sprintf((*u8)(uintptr(buf)), "r%d", r)
+        return (*i8)(uintptr(buf))
+    }
+
     if expr.kind == NODE_STR_LIT {
-        s_id := c.str_count
-        if c.str_count < 128 {
-            c.strings[c.str_count] = expr.str_val
-            c.str_count += 1
+        var s_id int = -1
+        var idx int = 0
+        for idx < c.str_count {
+            if StrEq(c.strings[idx], expr.str_val) {
+                s_id = idx
+                break
+            }
+            idx += 1
+        }
+        if s_id < 0 {
+            s_id = c.str_count
+            if c.str_count < 1024 {
+                c.strings[c.str_count] = expr.str_val
+                c.str_count += 1
+            }
         }
         str_len := StrLen(expr.str_val) + 1
+        res_reg := c.NewReg()
 
-        fprintf(c.out_fp, "  %%str.%d = getelementptr inbounds [%lu x i8], [%lu x i8]* @.str.%d, i64 0, i64 0\n",
-                s_id, str_len, str_len, s_id)
+        fprintf(c.out_fp, "  %%r%d = getelementptr inbounds [%lu x i8], [%lu x i8]* @.str.%d, i64 0, i64 0\n",
+                res_reg, str_len, str_len, s_id)
 
         buf := malloc(32)
-        sprintf(buf, "str.%d", s_id)
+        sprintf(buf, "r%d", res_reg)
         return (*i8)(uintptr(buf))
     }
 
     if expr.kind == NODE_BINARY {
         l_reg := c.GenerateExpr(expr.left)
         r_reg := c.GenerateExpr(expr.right)
+        l_ty := c.InferExprType(expr.left)
+        r_ty := c.InferExprType(expr.right)
         res_reg := c.NewReg()
+
+        var is_flt bool = false
+        if StrEq(l_ty, "double") || StrEq(r_ty, "double") || StrEq(l_ty, "float") || StrEq(r_ty, "float") {
+            is_flt = true
+        }
+
+        if is_flt {
+            var f_ty *i8 = "double"
+            if StrEq(l_ty, "float") && StrEq(r_ty, "float") {
+                f_ty = "float"
+            }
+            f_op := "fadd"
+            if expr.op == TOK_MINUS { f_op = "fsub" }
+            if expr.op == TOK_STAR { f_op = "fmul" }
+            if expr.op == TOK_SLASH { f_op = "fdiv" }
+            if expr.op == TOK_EQ { f_op = "fcmp oeq" }
+            if expr.op == TOK_NOT_EQ { f_op = "fcmp one" }
+            if expr.op == TOK_LT { f_op = "fcmp olt" }
+            if expr.op == TOK_LT_EQ { f_op = "fcmp ole" }
+            if expr.op == TOK_GT { f_op = "fcmp ogt" }
+            if expr.op == TOK_GT_EQ { f_op = "fcmp oge" }
+
+            fprintf(c.out_fp, "  %%r%d = %s %s %%%s, %%%s\n", res_reg, f_op, f_ty, l_reg, r_reg)
+            buf := malloc(32)
+            sprintf(buf, "r%d", res_reg)
+            return (*i8)(uintptr(buf))
+        }
 
         op_str := "add"
         if expr.op == TOK_MINUS { op_str = "sub" }
@@ -365,25 +1928,390 @@ func (c *Codegen) GenerateExpr(expr *Node) *i8 {
         if expr.op == TOK_LT_EQ { op_str = "icmp sle" }
         if expr.op == TOK_GT { op_str = "icmp sgt" }
         if expr.op == TOK_GT_EQ { op_str = "icmp sge" }
+        if expr.op == TOK_AND { op_str = "and" }
+        if expr.op == TOK_OR { op_str = "or" }
 
-        fprintf(c.out_fp, "  %%r%d = %s i64 %%%s, %%%s\n", res_reg, op_str, l_reg, r_reg)
+        if expr.op == TOK_AND || expr.op == TOK_OR {
+            fprintf(c.out_fp, "  %%r%d = %s i1 %%%s, %%%s\n", res_reg, op_str, l_reg, r_reg)
+        } else if c.IsExprPointer(expr.left) || c.IsExprPointer(expr.right) {
+            fprintf(c.out_fp, "  %%r%d = %s i8* %%%s, %%%s\n", res_reg, op_str, l_reg, r_reg)
+        } else {
+            fprintf(c.out_fp, "  %%r%d = %s i64 %%%s, %%%s\n", res_reg, op_str, l_reg, r_reg)
+        }
         buf := malloc(32)
         sprintf(buf, "r%d", res_reg)
         return (*i8)(uintptr(buf))
     }
 
+    if expr.kind == NODE_UNARY {
+        if expr.op == TOK_MINUS {
+            inner_reg := c.GenerateExpr(expr.left)
+            res_reg := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = sub i64 0, %%%s\n", res_reg, inner_reg)
+            buf := malloc(32)
+            sprintf(buf, "r%d", res_reg)
+            return (*i8)(uintptr(buf))
+        } else if expr.op == TOK_BANG {
+            inner_reg := c.GenerateExpr(expr.left)
+            res_reg := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = xor i1 %%%s, true\n", res_reg, inner_reg)
+            buf := malloc(32)
+            sprintf(buf, "r%d", res_reg)
+            return (*i8)(uintptr(buf))
+        } else if expr.op == TOK_AMP {
+            return c.GenerateExprPtr(expr.left)
+        } else if expr.op == TOK_STAR {
+            inner_ty := c.InferExprType(expr.left)
+            ptr_reg := c.GenerateExpr(expr.left)
+            // Generic deref: load the pointee; narrow ints are widened to i64
+            // (the expression language operates on i64; stores narrow back via
+            // EmitStoreCast).
+            tlen := StrLen(inner_ty)
+            var is_star bool = false
+            if tlen > 0 {
+                if *((*u8)(uintptr(inner_ty) + tlen - 1)) == u8(42) { // '*'
+                    is_star = true
+                }
+            }
+            if is_star {
+                elem_ty := LlvmStripStar(inner_ty)
+                load_reg := c.NewReg()
+                if StrEq(elem_ty, "i8") {
+                    fprintf(c.out_fp, "  %%r%d = load i8, i8* %%%s, align 1\n", load_reg, ptr_reg)
+                    zext_reg := c.NewReg()
+                    fprintf(c.out_fp, "  %%r%d = zext i8 %%r%d to i64\n", zext_reg, load_reg)
+                    buf := malloc(32)
+                    sprintf(buf, "r%d", zext_reg)
+                    return (*i8)(uintptr(buf))
+                } else if StrEq(elem_ty, "i16") {
+                    fprintf(c.out_fp, "  %%r%d = load i16, i16* %%%s, align 2\n", load_reg, ptr_reg)
+                    zext_reg := c.NewReg()
+                    fprintf(c.out_fp, "  %%r%d = zext i16 %%r%d to i64\n", zext_reg, load_reg)
+                    buf := malloc(32)
+                    sprintf(buf, "r%d", zext_reg)
+                    return (*i8)(uintptr(buf))
+                } else if StrEq(elem_ty, "i32") {
+                    fprintf(c.out_fp, "  %%r%d = load i32, i32* %%%s, align 4\n", load_reg, ptr_reg)
+                    zext_reg := c.NewReg()
+                    fprintf(c.out_fp, "  %%r%d = zext i32 %%r%d to i64\n", zext_reg, load_reg)
+                    buf := malloc(32)
+                    sprintf(buf, "r%d", zext_reg)
+                    return (*i8)(uintptr(buf))
+                } else {
+                    fprintf(c.out_fp, "  %%r%d = load %s, %s* %%%s, align 8\n", load_reg, elem_ty, elem_ty, ptr_reg)
+                    buf := malloc(32)
+                    sprintf(buf, "r%d", load_reg)
+                    return (*i8)(uintptr(buf))
+                }
+            }
+            // Fallback for non-pointer inner expressions (treated as i8* bytes).
+            var cast_reg *i8 = ptr_reg
+            if !c.IsExprPointer(expr.left) {
+                r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = inttoptr i64 %%%s to i8*\n", r, ptr_reg)
+                buf := malloc(32)
+                sprintf(buf, "r%d", r)
+                cast_reg = (*i8)(uintptr(buf))
+            }
+            load_reg := c.NewReg()
+            zext_reg := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = load i8, i8* %%%s, align 1\n", load_reg, cast_reg)
+            fprintf(c.out_fp, "  %%r%d = zext i8 %%r%d to i64\n", zext_reg, load_reg)
+            buf := malloc(32)
+            sprintf(buf, "r%d", zext_reg)
+            return (*i8)(uintptr(buf))
+        }
+    }
+
+    if expr.kind == NODE_MEMBER {
+        field_ptr := c.GenerateExprPtr(expr)
+        struct_name := c.InferStructName(expr.left)
+        field_ty := c.GetFieldType(struct_name, expr.name)
+        res_reg := c.NewReg()
+        if StrEq(field_ty, "i1") {
+            fprintf(c.out_fp, "  %%r%d = load i1, i1* %%%s, align 1\n", res_reg, field_ptr)
+        } else if StrEq(field_ty, "i8") {
+            fprintf(c.out_fp, "  %%r%d = load i8, i8* %%%s, align 1\n", res_reg, field_ptr)
+            zext_reg := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = zext i8 %%r%d to i64\n", zext_reg, res_reg)
+            res_reg = zext_reg
+        } else if StrEq(field_ty, "i16") {
+            fprintf(c.out_fp, "  %%r%d = load i16, i16* %%%s, align 2\n", res_reg, field_ptr)
+            zext_reg := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = zext i16 %%r%d to i64\n", zext_reg, res_reg)
+            res_reg = zext_reg
+        } else if StrEq(field_ty, "i32") {
+            fprintf(c.out_fp, "  %%r%d = load i32, i32* %%%s, align 4\n", res_reg, field_ptr)
+            zext_reg := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = zext i32 %%r%d to i64\n", zext_reg, res_reg)
+            res_reg = zext_reg
+        } else if StrEq(field_ty, "i8*") {
+            fprintf(c.out_fp, "  %%r%d = load i8*, i8** %%%s, align 8\n", res_reg, field_ptr)
+        } else if StrEq(field_ty, "%struct.Token") {
+            fprintf(c.out_fp, "  %%r%d = load %%struct.Token, %%struct.Token* %%%s, align 8\n", res_reg, field_ptr)
+        } else if StrEq(field_ty, "%struct.Node*") {
+            fprintf(c.out_fp, "  %%r%d = load %%struct.Node*, %%struct.Node** %%%s, align 8\n", res_reg, field_ptr)
+        } else if StrEq(field_ty, "%struct.Arena*") {
+            fprintf(c.out_fp, "  %%r%d = load %%struct.Arena*, %%struct.Arena** %%%s, align 8\n", res_reg, field_ptr)
+        } else if StrStartsWith(field_ty, "%struct.") {
+            fprintf(c.out_fp, "  %%r%d = load %s, %s* %%%s, align 8\n", res_reg, field_ty, field_ty, field_ptr)
+        } else {
+            fprintf(c.out_fp, "  %%r%d = load i64, i64* %%%s, align 8\n", res_reg, field_ptr)
+        }
+        buf := malloc(32)
+        sprintf((*u8)(uintptr(buf)), "r%d", res_reg)
+        return (*i8)(uintptr(buf))
+    }
+
+    if expr.kind == NODE_INDEX {
+        elem_ptr := c.GenerateExprPtr(expr)
+        elem_ty := c.InferExprType(expr)
+        res_reg := c.NewReg()
+        var align int = 8
+        if StrEq(elem_ty, "i8") || StrEq(elem_ty, "i1") { align = 1 }
+        if StrEq(elem_ty, "i16") { align = 2 }
+        if StrEq(elem_ty, "i32") { align = 4 }
+        fprintf(c.out_fp, "  %%r%d = load %s, %s* %%%s, align %d\n", res_reg, elem_ty, elem_ty, elem_ptr, align)
+        if StrEq(elem_ty, "i8") || StrEq(elem_ty, "i16") || StrEq(elem_ty, "i32") {
+            zext_reg := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = zext %s %%r%d to i64\n", zext_reg, elem_ty, res_reg)
+            buf := malloc(32)
+            sprintf(buf, "r%d", zext_reg)
+            return (*i8)(uintptr(buf))
+        }
+        buf := malloc(32)
+        sprintf(buf, "r%d", res_reg)
+        return (*i8)(uintptr(buf))
+    }
+
+    if expr.kind == NODE_STRUCT_LIT {
+        struct_name := expr.name
+        cur_val := malloc(64)
+        sprintf(cur_val, "undef")
+
+        f_node := expr.args
+        for uintptr(f_node) != 0 {
+            val_reg := c.GenerateExpr(f_node.right)
+            field_idx := c.GetFieldIdx(struct_name, f_node.name)
+            field_ty := c.GetFieldType(struct_name, f_node.name)
+            src_ty := c.InferExprType(f_node.right)
+            // Literal values arrive as i64; narrow them to the field type.
+            cast_reg := c.EmitStoreCast(val_reg, field_ty, src_ty)
+            next_reg := c.NewReg()
+            fprintf(c.out_fp, "  %%r%d = insertvalue %%struct.%s %s, %s %%%s, %d\n",
+                    next_reg, struct_name, (*i8)(uintptr(cur_val)), field_ty, cast_reg, field_idx)
+            sprintf(cur_val, "%%r%d", next_reg)
+            f_node = f_node.next
+        }
+
+        buf := malloc(32)
+        sprintf(buf, "%s", (*i8)(uintptr(cur_val) + 1))
+        return (*i8)(uintptr(buf))
+    }
+
     if expr.kind == NODE_CALL {
+        // Cast check
+        if expr.left.kind == NODE_IDENT {
+            callee := expr.left.name
+            if StrEq(callee, "uintptr") || StrEq(callee, "int") || StrEq(callee, "usize") ||
+               StrEq(callee, "isize") || StrEq(callee, "u64") || StrEq(callee, "i64") {
+                arg_reg := c.GenerateExpr(expr.args)
+                arg_ty := c.InferExprType(expr.args)
+                if StrEq(arg_ty, "double") || StrEq(arg_ty, "float") {
+                    r := c.NewReg()
+                    fprintf(c.out_fp, "  %%r%d = fptosi %s %%%s to i64\n", r, arg_ty, arg_reg)
+                    buf := malloc(32)
+                    sprintf(buf, "r%d", r)
+                    return (*i8)(uintptr(buf))
+                }
+                if c.IsExprPointer(expr.args) {
+                    ptr_ty := c.InferExprType(expr.args)
+                    r := c.NewReg()
+                    fprintf(c.out_fp, "  %%r%d = ptrtoint %s %%%s to i64\n", r, ptr_ty, arg_reg)
+                    buf := malloc(32)
+                    sprintf(buf, "r%d", r)
+                    return (*i8)(uintptr(buf))
+                }
+                return arg_reg
+            }
+            if StrEq(callee, "f64") {
+                arg_reg := c.GenerateExpr(expr.args)
+                arg_ty := c.InferExprType(expr.args)
+                if StrEq(arg_ty, "float") {
+                    r := c.NewReg()
+                    fprintf(c.out_fp, "  %%r%d = fpext float %%%s to double\n", r, arg_reg)
+                    buf := malloc(32)
+                    sprintf(buf, "r%d", r)
+                    return (*i8)(uintptr(buf))
+                }
+                if StrEq(arg_ty, "double") {
+                    return arg_reg
+                }
+                r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = sitofp i64 %%%s to double\n", r, arg_reg)
+                buf := malloc(32)
+                sprintf(buf, "r%d", r)
+                return (*i8)(uintptr(buf))
+            }
+            if StrEq(callee, "f32") {
+                arg_reg := c.GenerateExpr(expr.args)
+                arg_ty := c.InferExprType(expr.args)
+                if StrEq(arg_ty, "double") {
+                    r := c.NewReg()
+                    fprintf(c.out_fp, "  %%r%d = fptrunc double %%%s to float\n", r, arg_reg)
+                    buf := malloc(32)
+                    sprintf(buf, "r%d", r)
+                    return (*i8)(uintptr(buf))
+                }
+                if StrEq(arg_ty, "float") {
+                    return arg_reg
+                }
+                r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = sitofp i64 %%%s to float\n", r, arg_reg)
+                buf := malloc(32)
+                sprintf(buf, "r%d", r)
+                return (*i8)(uintptr(buf))
+            }
+            if StrEq(callee, "u8") || StrEq(callee, "i8") {
+                arg_reg := c.GenerateExpr(expr.args)
+                r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = and i64 %%%s, 255\n", r, arg_reg)
+                buf := malloc(32)
+                sprintf((*u8)(uintptr(buf)), "r%d", r)
+                return (*i8)(uintptr(buf))
+            }
+            if StrEq(callee, "u16") || StrEq(callee, "i16") {
+                arg_reg := c.GenerateExpr(expr.args)
+                r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = and i64 %%%s, 65535\n", r, arg_reg)
+                buf := malloc(32)
+                sprintf((*u8)(uintptr(buf)), "r%d", r)
+                return (*i8)(uintptr(buf))
+            }
+            if StrEq(callee, "u32") || StrEq(callee, "i32") {
+                arg_reg := c.GenerateExpr(expr.args)
+                r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = and i64 %%%s, 4294967295\n", r, arg_reg)
+                buf := malloc(32)
+                sprintf((*u8)(uintptr(buf)), "r%d", r)
+                return (*i8)(uintptr(buf))
+            }
+        }
+        if expr.left.kind == NODE_UNARY && expr.left.op == TOK_STAR {
+            arg_reg := c.GenerateExpr(expr.args)
+            if expr.left.left.kind == NODE_IDENT {
+                // (*T)(expr): inttoptr always yields a pointer; if T maps to a
+                // non-pointer LLVM type (e.g. "u8" -> "i8", "Node" -> "%struct.Node"),
+                // point at it.
+                tn := expr.left.left.name
+                target_llvm := c.TypeStrToLlvm(tn)
+                tlen := StrLen(target_llvm)
+                if !(*((*u8)(uintptr(target_llvm) + tlen - 1)) == u8(42)) {
+                    ptr_buf := malloc(80)
+                    sprintf((*u8)(uintptr(ptr_buf)), "%s*", target_llvm)
+                    target_llvm = ptr_buf
+                }
+                r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = inttoptr i64 %%%s to %s\n", r, arg_reg, target_llvm)
+                buf := malloc(32)
+                sprintf(buf, "r%d", r)
+                return (*i8)(uintptr(buf))
+            } else if expr.left.left.kind == NODE_UNARY {
+                r := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = inttoptr i64 %%%s to i8**\n", r, arg_reg)
+                buf := malloc(32)
+                sprintf(buf, "r%d", r)
+                return (*i8)(uintptr(buf))
+            }
+            return arg_reg
+        }
+
+        // Method call check: target.Method(args)
+        if expr.left.kind == NODE_MEMBER {
+            target := expr.left.left
+            method_name := expr.left.name
+            struct_name := c.InferMethodStruct(method_name, target)
+            ret_ty := c.GetMethodReturnType(struct_name, method_name)
+
+            var recv_reg *i8 = (*i8)(uintptr(0))
+            if target.kind == NODE_IDENT {
+                t_ty := c.GetLocalType(target.name)
+                var is_ptr bool = false
+                if uintptr(t_ty) != 0 {
+                    if *((*u8)(uintptr(t_ty))) == u8(42) {
+                        is_ptr = true
+                    }
+                }
+                if is_ptr {
+                    recv_reg = c.GenerateExpr(target)
+                } else {
+                    recv_reg = target.name
+                }
+            } else if target.kind == NODE_MEMBER {
+                t_struct := c.InferStructName(target.left)
+                f_ty := c.GetFieldType(t_struct, target.name)
+                var is_ptr bool = false
+                if uintptr(f_ty) != 0 {
+                    flen := StrLen(f_ty)
+                    if flen > 0 {
+                        if *((*u8)(uintptr(f_ty) + flen - 1)) == u8(42) {
+                            is_ptr = true
+                        }
+                    }
+                }
+                if is_ptr {
+                    recv_reg = c.GenerateExpr(target)
+                } else {
+                    recv_reg = c.GenerateExprPtr(target)
+                }
+            } else {
+                recv_reg = c.GenerateExpr(target)
+            }
+
+            var arg_regs [8]*i8
+            var arg_types [8]*i8
+            var arg_count int = 0
+            a_node := expr.args
+            for uintptr(a_node) != 0 && arg_count < 8 {
+                arg_regs[arg_count] = c.GenerateExpr(a_node)
+                arg_types[arg_count] = c.InferExprType(a_node)
+                arg_count += 1
+                a_node = a_node.next
+            }
+
+            res_reg := c.NewReg()
+            if StrEq(ret_ty, "void") {
+                fprintf(c.out_fp, "  call void @%s_%s(%%struct.%s* %%%s", struct_name, method_name, struct_name, recv_reg)
+            } else {
+                fprintf(c.out_fp, "  %%r%d = call %s @%s_%s(%%struct.%s* %%%s", res_reg, ret_ty, struct_name, method_name, struct_name, recv_reg)
+            }
+            var i int = 0
+            for i < arg_count {
+                fprintf(c.out_fp, ", %s %%%s", arg_types[i], arg_regs[i])
+                i += 1
+            }
+            fputs(")\n", c.out_fp)
+
+            if StrEq(ret_ty, "i8") {
+                zext_reg := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = zext i8 %%r%d to i64\n", zext_reg, res_reg)
+                res_reg = zext_reg
+            }
+
+            buf := malloc(32)
+            sprintf(buf, "r%d", res_reg)
+            return (*i8)(uintptr(buf))
+        }
+
         func_name := expr.left.name
         res_reg := c.NewReg()
 
         // Evaluate arguments
         var arg_regs [8]*i8
-        var arg_is_str [8]bool
         var arg_count int = 0
         arg_node := expr.args
         for uintptr(arg_node) != 0 && arg_count < 8 {
             arg_regs[arg_count] = c.GenerateExpr(arg_node)
-            arg_is_str[arg_count] = (arg_node.kind == NODE_STR_LIT)
             arg_count += 1
             arg_node = arg_node.next
         }
@@ -391,28 +2319,162 @@ func (c *Codegen) GenerateExpr(expr *Node) *i8 {
         if StrEq(func_name, "printf") {
             fprintf(c.out_fp, "  %%r%d = call i32 (i8*, ...) @printf(i8* %%%s", res_reg, arg_regs[0])
             var a_idx int = 1
+            var p_arg *Node = expr.args
+            if uintptr(p_arg) != 0 {
+                p_arg = p_arg.next
+            }
             for a_idx < arg_count {
-                fprintf(c.out_fp, ", i64 %%%s", arg_regs[a_idx])
+                var p_ty *i8 = "i64"
+                if uintptr(p_arg) != 0 && c.IsExprPointer(p_arg) {
+                    p_ty = "i8*"
+                }
+                fprintf(c.out_fp, ", %s %%%s", p_ty, arg_regs[a_idx])
                 a_idx += 1
+                if uintptr(p_arg) != 0 {
+                    p_arg = p_arg.next
+                }
+            }
+            fputs(")\n", c.out_fp)
+        } else if StrEq(func_name, "fprintf") {
+            fprintf(c.out_fp, "  %%r%d = call i32 (i8*, i8*, ...) @fprintf(i8* %%%s, i8* %%%s", res_reg, arg_regs[0], arg_regs[1])
+            var a_idx int = 2
+            var p_arg *Node = expr.args
+            if uintptr(p_arg) != 0 {
+                p_arg = p_arg.next
+                if uintptr(p_arg) != 0 {
+                    p_arg = p_arg.next
+                }
+            }
+            for a_idx < arg_count {
+                var p_ty *i8 = "i64"
+                if uintptr(p_arg) != 0 && c.IsExprPointer(p_arg) {
+                    p_ty = "i8*"
+                }
+                fprintf(c.out_fp, ", %s %%%s", p_ty, arg_regs[a_idx])
+                a_idx += 1
+                if uintptr(p_arg) != 0 {
+                    p_arg = p_arg.next
+                }
+            }
+            fputs(")\n", c.out_fp)
+        } else if StrEq(func_name, "sprintf") {
+            fprintf(c.out_fp, "  %%r%d = call i32 (i8*, i8*, ...) @sprintf(i8* %%%s, i8* %%%s", res_reg, arg_regs[0], arg_regs[1])
+            var a_idx int = 2
+            var p_arg *Node = expr.args
+            if uintptr(p_arg) != 0 {
+                p_arg = p_arg.next
+                if uintptr(p_arg) != 0 {
+                    p_arg = p_arg.next
+                }
+            }
+            for a_idx < arg_count {
+                var p_ty *i8 = "i64"
+                if uintptr(p_arg) != 0 && c.IsExprPointer(p_arg) {
+                    p_ty = "i8*"
+                }
+                fprintf(c.out_fp, ", %s %%%s", p_ty, arg_regs[a_idx])
+                a_idx += 1
+                if uintptr(p_arg) != 0 {
+                    p_arg = p_arg.next
+                }
             }
             fputs(")\n", c.out_fp)
         } else if StrEq(func_name, "puts") {
             fprintf(c.out_fp, "  %%r%d = call i32 @puts(i8* %%%s)\n", res_reg, arg_regs[0])
+        } else if StrEq(func_name, "malloc") {
+            fprintf(c.out_fp, "  %%r%d = call i8* @malloc(i64 %%%s)\n", res_reg, arg_regs[0])
+        } else if StrEq(func_name, "free") {
+            fprintf(c.out_fp, "  call void @free(i8* %%%s)\n", arg_regs[0])
+        } else if StrEq(func_name, "fopen") {
+            fprintf(c.out_fp, "  %%r%d = call i8* @fopen(i8* %%%s, i8* %%%s)\n", res_reg, arg_regs[0], arg_regs[1])
+        } else if StrEq(func_name, "fclose") {
+            fprintf(c.out_fp, "  %%r%d = call i32 @fclose(i8* %%%s)\n", res_reg, arg_regs[0])
+        } else if StrEq(func_name, "fputs") {
+            fprintf(c.out_fp, "  %%r%d = call i32 @fputs(i8* %%%s, i8* %%%s)\n", res_reg, arg_regs[0], arg_regs[1])
+        } else if StrEq(func_name, "AllocNode") {
+            fprintf(c.out_fp, "  %%r%d = call %%struct.Node* @AllocNode(%%struct.Arena* %%%s, i64 %%%s, i64 %%%s, i64 %%%s)\n",
+                    res_reg, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3])
+        } else if StrEq(func_name, "MakeToken") {
+            fprintf(c.out_fp, "  %%r%d = call %%struct.Token @MakeToken(i64 %%%s, i64 %%%s, i64 %%%s, i64 %%%s, i8* %%%s)\n",
+                    res_reg, arg_regs[0], arg_regs[1], arg_regs[2], arg_regs[3], arg_regs[4])
+        } else if StrEq(func_name, "MakeFileData") {
+            fprintf(c.out_fp, "  %%r%d = call %%struct.FileData @MakeFileData(i8* %%%s, i64 %%%s)\n",
+                    res_reg, arg_regs[0], arg_regs[1])
+        } else if StrEq(func_name, "ReadFile") {
+            fprintf(c.out_fp, "  %%r%d = call %%struct.FileData @ReadFile(i8* %%%s)\n", res_reg, arg_regs[0])
+        } else if StrEq(func_name, "StrLen") {
+            fprintf(c.out_fp, "  %%r%d = call i64 @StrLen(i8* %%%s)\n", res_reg, arg_regs[0])
+        } else if StrEq(func_name, "StrEq") {
+            fprintf(c.out_fp, "  %%r%d = call i1 @StrEq(i8* %%%s, i8* %%%s)\n", res_reg, arg_regs[0], arg_regs[1])
+        } else if StrEq(func_name, "CanPrecedeSemicolon") {
+            fprintf(c.out_fp, "  %%r%d = call i1 @CanPrecedeSemicolon(i64 %%%s)\n", res_reg, arg_regs[0])
+        } else if StrEq(func_name, "WriteFile") {
+            fprintf(c.out_fp, "  %%r%d = call i1 @WriteFile(i8* %%%s, i8* %%%s, i64 %%%s)\n",
+                    res_reg, arg_regs[0], arg_regs[1], arg_regs[2])
+        } else if StrEq(func_name, "Exec") {
+            fprintf(c.out_fp, "  %%r%d = call i64 @Exec(i8* %%%s)\n", res_reg, arg_regs[0])
         } else {
-            fprintf(c.out_fp, "  %%r%d = call i64 @%s(", res_reg, func_name)
+            // Generic call: use the scanned signature for return type and
+            // known parameter types where the argument expression's own type
+            // inference is incomplete.
+            var ret_ty *i8 = "i64"
+            fi := c.FindFunc(func_name)
+            if fi >= 0 {
+                ret_ty = c.func_rets[fi]
+            }
+            // Pre-pass: truncate i64 computed args to narrow scanned param types,
+            // before the call instruction is emitted.
+            var arg_final [8]*i8
+            var arg_final_ty [8]*i8
+            a_idx2 := 0
+            arg_node = expr.args
+            for a_idx2 < arg_count {
+                var fty *i8 = c.InferExprType(arg_node)
+                var fval *i8 = arg_regs[a_idx2]
+                if fi >= 0 && a_idx2 < c.func_pcount[fi] {
+                    pt := c.func_ptypes[fi][a_idx2]
+                    if uintptr(arg_node) != 0 && (arg_node.kind == NODE_INT_LIT || arg_node.kind == NODE_BINARY ||
+                       arg_node.kind == NODE_UNARY) && StrEq(fty, "i64") &&
+                       (StrEq(pt, "i8") || StrEq(pt, "i16") || StrEq(pt, "i32")) {
+                        trunc_r := c.NewReg()
+                        fprintf(c.out_fp, "  %%r%d = trunc i64 %%%s to %s\n", trunc_r, fval, pt)
+                        buf2 := malloc(32)
+                        sprintf(buf2, "r%d", trunc_r)
+                        fval = buf2
+                        fty = pt
+                    } else if uintptr(arg_node) != 0 && arg_node.kind == NODE_STR_LIT {
+                        fty = "i8*"
+                    }
+                }
+                arg_final[a_idx2] = fval
+                arg_final_ty[a_idx2] = fty
+                a_idx2 += 1
+                if uintptr(arg_node) != 0 {
+                    arg_node = arg_node.next
+                }
+            }
+
+            if StrEq(ret_ty, "void") {
+                fprintf(c.out_fp, "  call void @%s(", func_name)
+            } else {
+                fprintf(c.out_fp, "  %%r%d = call %s @%s(", res_reg, ret_ty, func_name)
+            }
             var a_idx int = 0
             for a_idx < arg_count {
                 if a_idx > 0 {
                     fputs(", ", c.out_fp)
                 }
-                if arg_is_str[a_idx] {
-                    fprintf(c.out_fp, "i8* %%%s", arg_regs[a_idx])
-                } else {
-                    fprintf(c.out_fp, "i64 %%%s", arg_regs[a_idx])
-                }
+                fprintf(c.out_fp, "%s %%%s", arg_final_ty[a_idx], arg_final[a_idx])
                 a_idx += 1
             }
             fputs(")\n", c.out_fp)
+            // Narrow int results widen to i64, except i1: conditions and logic
+            // ops consume raw i1.
+            if !StrEq(ret_ty, "void") && (StrEq(ret_ty, "i8") || StrEq(ret_ty, "i16") || StrEq(ret_ty, "i32")) {
+                zext_reg := c.NewReg()
+                fprintf(c.out_fp, "  %%r%d = zext %s %%r%d to i64\n", zext_reg, ret_ty, res_reg)
+                res_reg = zext_reg
+            }
         }
 
         buf := malloc(32)
@@ -421,11 +2483,104 @@ func (c *Codegen) GenerateExpr(expr *Node) *i8 {
     }
 
     if expr.kind == NODE_INLINE_ASM {
-        fprintf(c.out_fp, "  call void asm sideeffect \"%s\", \"\"()\n", expr.str_val)
+        // Bare asm without constraints
+        if uintptr(expr.args) == 0 {
+            fprintf(c.out_fp, "  call void asm sideeffect \"%s\", \"\"()\n", expr.str_val)
+            return "0"
+        }
+        // Constraint form: inline_asm("..." : : "c"(a), "c"(b))
+        // Rewrite %N placeholders to $N and emit each input register.
+        asm_len := int(StrLen(expr.str_val))
+        formatted := malloc(256)
+        var f_off int = 0
+        var ai int = 0
+        for ai < asm_len {
+            ch_b := *((*u8)(uintptr(expr.str_val) + ai))
+            if ch_b == u8(37) && ai + 1 < asm_len { // '%'
+                nxt := *((*u8)(uintptr(expr.str_val) + ai + 1))
+                if nxt >= u8(48) && nxt <= u8(57) {
+                    // Copy '$' followed by the digit, consuming both.
+                    *((*u8)(uintptr(formatted) + f_off)) = u8(36) // '$'
+                    f_off += 1
+                    *((*u8)(uintptr(formatted) + f_off)) = nxt
+                    f_off += 1
+                    ai += 2
+                    continue
+                }
+            }
+            *((*u8)(uintptr(formatted) + f_off)) = ch_b
+            f_off += 1
+            ai += 1
+        }
+        *((*u8)(uintptr(formatted) + f_off)) = u8(0)
+
+        var in_regs [8]*i8
+        var in_types [8]*i8
+        var con_strs [8]*i8
+        var in_count int = 0
+        c_node := expr.args
+        for uintptr(c_node) != 0 && in_count < 8 {
+            val_reg := c.GenerateExpr(c_node.right)
+            // Narrow i64 expression results back to the operand's declared type
+            // (asm operands must match their constraint registers).
+            var op_ty *i8 = c.InferExprType(c_node.right)
+            if c_node.right.kind == NODE_IDENT {
+                vty := c.GetLocalType(c_node.right.name)
+                if uintptr(vty) != 0 {
+                    op_ty = c.TypeStrToLlvm(vty)
+                }
+            }
+            if c_node.right.kind == NODE_CALL && c_node.right.left.kind == NODE_IDENT {
+                cn := c_node.right.left.name
+                if StrEq(cn, "u8") || StrEq(cn, "i8") { op_ty = "i8" }
+                if StrEq(cn, "u16") || StrEq(cn, "i16") { op_ty = "i16" }
+                if StrEq(cn, "u32") || StrEq(cn, "i32") { op_ty = "i32" }
+            }
+            if StrEq(op_ty, "i8") || StrEq(op_ty, "i16") || StrEq(op_ty, "i32") {
+                cast_val := c.EmitStoreCast(val_reg, op_ty, "i64")
+                val_reg = cast_val
+            } else {
+                op_ty = "i64"
+            }
+            in_regs[in_count] = val_reg
+            in_types[in_count] = op_ty
+            con_strs[in_count] = c_node.str_val
+            in_count += 1
+            c_node = c_node.next
+        }
+
+        // Constraint string: "con1,con2" — one quoted, comma-separated list.
+        con_buf := malloc(128)
+        var con_off int = 0
+        var i int = 0
+        for i < in_count {
+            clen := int(StrLen(con_strs[i]))
+            var k int = 0
+            for k < clen {
+                *((*u8)(uintptr(con_buf) + con_off)) = *((*u8)(uintptr(con_strs[i]) + k))
+                con_off += 1
+                k += 1
+            }
+            if i < in_count - 1 {
+                *((*u8)(uintptr(con_buf) + con_off)) = u8(44) // ','
+                con_off += 1
+            }
+            i += 1
+        }
+        *((*u8)(uintptr(con_buf) + con_off)) = u8(0)
+
+        var arg_list int = 0
+        fprintf(c.out_fp, "  call void asm sideeffect \"%s\", \"%s\"(", formatted, con_buf)
+        for arg_list < in_count {
+            fprintf(c.out_fp, "%s %%%s", in_types[arg_list], in_regs[arg_list])
+            if arg_list < in_count - 1 {
+                fputs(", ", c.out_fp)
+            }
+            arg_list += 1
+        }
+        fputs(")\n", c.out_fp)
         return "0"
     }
 
     return "0"
 }
-
-extern func sprintf(str *u8, format *i8, ...) i32

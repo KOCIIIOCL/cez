@@ -7,7 +7,7 @@ pub struct StructFieldType {
     pub offset: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct StructType {
     pub name: String,
     pub fields: Vec<StructFieldType>,
@@ -16,6 +16,13 @@ pub struct StructType {
     pub total_size: usize,
     pub alignment: usize,
 }
+
+impl PartialEq for StructType {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+impl Eq for StructType {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncType {
@@ -85,6 +92,15 @@ impl Type {
 
     pub fn is_pointer(&self) -> bool {
         matches!(self, Type::Pointer(_))
+    }
+
+    /// Type after removing one level of pointer indirection.
+    /// Non-pointer types are returned unchanged.
+    pub fn deref_type(&self) -> Type {
+        match self {
+            Type::Pointer(inner) => (**inner).clone(),
+            _ => self.clone(),
+        }
     }
 
     pub fn is_slice(&self) -> bool {

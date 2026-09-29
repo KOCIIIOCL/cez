@@ -2,17 +2,69 @@ package main
 
 extern func printf(fmt *i8, ...) i32
 extern func puts(s *i8) i32
+extern func getenv(name *i8) *i8
 
 func main(argc int, argv **i8) int {
-    puts("=== Cez Self-Hosted Compiler (Stage 1) ===")
+    // Detect language: 0 = En, 1 = Ru, 2 = Uk
+    var lang int = 0
+    env_cez_lang := getenv("CEZ_LANG")
+    if uintptr(env_cez_lang) != 0 {
+        if *env_cez_lang == u8(114) { // 'r'
+            lang = 1
+        }
+        if *env_cez_lang == u8(117) { // 'u'
+            lang = 2
+        }
+    } else {
+        env_lang := getenv("LANG")
+        if uintptr(env_lang) != 0 {
+            if *env_lang == u8(114) { // 'r'
+                lang = 1
+            }
+            if *env_lang == u8(117) { // 'u'
+                lang = 2
+            }
+        }
+    }
+
+    // Check for --lang=... in command line arguments
+    var check_i int = 1
+    for check_i < argc {
+        c_arg := *(**i8)(uintptr(argv) + usize(check_i) * 8)
+        if StrEq(c_arg, "--lang=ru") {
+            lang = 1
+        }
+        if StrEq(c_arg, "--lang=uk") || StrEq(c_arg, "--lang=ua") {
+            lang = 2
+        }
+        if StrEq(c_arg, "--lang=en") {
+            lang = 0
+        }
+        check_i += 1
+    }
+
+    if lang == 1 {
+        puts("=== Самохостящийся компилятор Cez ===")
+    } else if lang == 2 {
+        puts("=== Самохостний компілятор Cez ===")
+    } else {
+        puts("=== Cez Self-Hosted Compiler ===")
+    }
 
     if argc < 2 {
-        puts("Usage: cez-stage1 <source1.cez> [source2.cez ...] [-o <output>]")
+        if lang == 1 {
+            puts("Использование: cez <исходник1.cez> [исходник2.cez ...] [-o <выходной_файл>]")
+        } else if lang == 2 {
+            puts("Використання: cez <вихідний1.cez> [вихідний2.cez ...] [-o <вихідний_файл>]")
+        } else {
+            puts("Usage: cez <source1.cez> [source2.cez ...] [-o <output>]")
+        }
         return 1
     }
 
     var output_bin *i8 = "a.out"
     var files_count int = 0
+    var freestanding bool = false
 
     // Allocate 64MB Arena for multi-file compilation
     arena_buf := malloc(64 * 1024 * 1024)
@@ -33,11 +85,33 @@ func main(argc int, argv **i8) int {
                 continue
             }
         }
+        if StrEq(arg, "--freestanding") {
+            freestanding = true
+            i += 1
+            continue
+        }
+        if StrEq(arg, "--lang=ru") || StrEq(arg, "--lang=uk") || StrEq(arg, "--lang=ua") || StrEq(arg, "--lang=en") {
+            i += 1
+            continue
+        }
 
-        printf("[Cez] Loading: %s\n", arg)
+        if lang == 1 {
+            printf("[Cez] Загрузка: %s\n", arg)
+        } else if lang == 2 {
+            printf("[Cez] Завантаження: %s\n", arg)
+        } else {
+            printf("[Cez] Loading: %s\n", arg)
+        }
+
         file := ReadFile(arg)
         if uintptr(file.data) == 0 {
-            printf("[Cez Error] Could not read file '%s'\n", arg)
+            if lang == 1 {
+                printf("[Cez Ошибка] Не удалось прочитать файл '%s'\n", arg)
+            } else if lang == 2 {
+                printf("[Cez Помилка] Не вдалося прочитати файл '%s'\n", arg)
+            } else {
+                printf("[Cez Error] Could not read file '%s'\n", arg)
+            }
             return 1
         }
 
@@ -64,7 +138,13 @@ func main(argc int, argv **i8) int {
     }
 
     if files_count == 0 {
-        puts("[Cez Error] No input files specified")
+        if lang == 1 {
+            puts("[Cez Ошибка] Не указаны входные файлы")
+        } else if lang == 2 {
+            puts("[Cez Помилка] Не вказано вхідні файли")
+        } else {
+            puts("[Cez Error] No input files specified")
+        }
         return 1
     }
 
@@ -73,11 +153,24 @@ func main(argc int, argv **i8) int {
     mode := "w"
     fp := fopen(temp_ll, mode)
     if uintptr(fp) == 0 {
-        puts("[Cez Error] Could not open temporary LLVM IR file")
+        if lang == 1 {
+            puts("[Cez Ошибка] Не удалось открыть временный файл LLVM IR")
+        } else if lang == 2 {
+            puts("[Cez Помилка] Не вдалося відкрити тимчасовий файл LLVM IR")
+        } else {
+            puts("[Cez Error] Could not open temporary LLVM IR file")
+        }
         return 1
     }
 
-    printf("[Cez] Generating LLVM IR...\n")
+    if lang == 1 {
+        printf("[Cez] Генерация LLVM IR...\n")
+    } else if lang == 2 {
+        printf("[Cez] Генерація LLVM IR...\n")
+    } else {
+        printf("[Cez] Generating LLVM IR...\n")
+    }
+
     var codegen Codegen
     codegen.Init(fp)
     codegen.Generate(root)
@@ -85,15 +178,39 @@ func main(argc int, argv **i8) int {
 
     // Invoke Clang
     cmd_buf := malloc(512)
-    sprintf(cmd_buf, "clang -O2 %s -o %s", temp_ll, output_bin)
-    printf("[Cez] Invoking backend linker: %s\n", (*i8)(uintptr(cmd_buf)))
+    if freestanding {
+        sprintf(cmd_buf, "clang -O2 -ffreestanding -nostdlib -c %s -o %s", temp_ll, output_bin)
+    } else {
+        sprintf(cmd_buf, "clang -O2 %s -o %s", temp_ll, output_bin)
+    }
+
+    if lang == 1 {
+        printf("[Cez] Запуск бэкенд-линкера: %s\n", (*i8)(uintptr(cmd_buf)))
+    } else if lang == 2 {
+        printf("[Cez] Запуск бекенд-лінкера: %s\n", (*i8)(uintptr(cmd_buf)))
+    } else {
+        printf("[Cez] Invoking backend linker: %s\n", (*i8)(uintptr(cmd_buf)))
+    }
+
     ret := Exec((*i8)(uintptr(cmd_buf)))
     free(cmd_buf)
 
     if ret == 0 {
-        printf("[Cez Success] Successfully built '%s' via self-hosted compiler!\n", output_bin)
+        if lang == 1 {
+            printf("[Cez Успех] Программа '%s' успешно собрана самохостящимся компилятором!\n", output_bin)
+        } else if lang == 2 {
+            printf("[Cez Успіх] Програму '%s' успішно зібрано самохостним компілятором!\n", output_bin)
+        } else {
+            printf("[Cez Success] Successfully built '%s' via self-hosted compiler!\n", output_bin)
+        }
     } else {
-        printf("[Cez Error] Backend linking failed with code %d\n", ret)
+        if lang == 1 {
+            printf("[Cez Ошибка] Ошибка линковки, код: %d\n", ret)
+        } else if lang == 2 {
+            printf("[Cez Помилка] Помилка лінкування, код: %d\n", ret)
+        } else {
+            printf("[Cez Error] Backend linking failed with code %d\n", ret)
+        }
         return 1
     }
 

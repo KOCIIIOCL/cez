@@ -1,0 +1,50 @@
+package main
+
+extern func puts(s *i8) i32
+extern func printf(fmt *i8, ...) i32
+
+func assert(cond bool, msg *i8) {
+    if !cond {
+        printf("[FAIL] Assertion failed: %s\n", msg)
+        // trigger exit via return/trap
+        puts("Test failed!")
+    }
+}
+
+func main() int {
+    puts("=== Test 01: Arithmetic & Bitwise ===")
+
+    // Basic arithmetic
+    a := 100
+    b := 25
+    if a + b != 125 { return 1 }
+    if a - b != 75 { return 2 }
+    if a * b != 2500 { return 3 }
+    if a / b != 4 { return 4 }
+    if a % 30 != 10 { return 5 }
+
+    // Negative numbers
+    c := -40
+    if -c != 40 { return 6 }
+    if c + 50 != 10 { return 7 }
+    if c * -2 != 80 { return 8 }
+
+    // Precedence: * before +
+    d := 2 + 3 * 4
+    if d != 14 { return 9 }
+
+    e := (2 + 3) * 4
+    if e != 20 { return 10 }
+
+    // Bitwise operators
+    x := 0xFF // 255
+    y := 0x0F // 15
+    if (x & y) != 15 { return 11 }
+    if (x | y) != 255 { return 12 }
+    if (x ^ y) != 240 { return 13 }
+    if (1 << 8) != 256 { return 14 }
+    if (1024 >> 4) != 64 { return 15 }
+
+    puts("[PASS] Test 01: Arithmetic & Bitwise passed cleanly")
+    return 0
+}

@@ -1,0 +1,64 @@
+package main
+
+extern func puts(s *i8) i32
+
+const MAX_LIMIT int = 500
+const BASE_OFFSET int = 42
+
+var g_counter int = 0
+var g_total int = 100
+var g_active int = 1
+
+func increment(delta int) {
+    g_counter += delta
+    g_total += delta * 2
+}
+
+func decrement(delta int) {
+    g_counter -= delta
+    g_total -= delta * 2
+}
+
+func test_shadowing() int {
+    // Local g_counter shadows the global g_counter
+    var g_counter int = 9999
+    g_counter += 1
+    return g_counter
+}
+
+func main() int {
+    puts("=== Test 10: Globals and Constants ===")
+
+    // 1. Constants
+    if MAX_LIMIT != 500 { return 1 }
+    if BASE_OFFSET != 42 { return 2 }
+    c_sum := MAX_LIMIT + BASE_OFFSET
+    if c_sum != 542 { return 3 }
+
+    // 2. Initial global values
+    if g_counter != 0 { return 4 }
+    if g_total != 100 { return 5 }
+    if g_active != 1 { return 6 }
+
+    // 3. Mutating globals via functions
+    increment(10)
+    if g_counter != 10 { return 7 }
+    if g_total != 120 { return 8 }
+
+    increment(25)
+    if g_counter != 35 { return 9 }
+    if g_total != 170 { return 10 }
+
+    decrement(15)
+    if g_counter != 20 { return 11 }
+    if g_total != 140 { return 12 }
+
+    // 4. Shadowing test
+    local_val := test_shadowing()
+    if local_val != 10000 { return 13 }
+    // Global g_counter should still be 20
+    if g_counter != 20 { return 14 }
+
+    puts("[PASS] Test 10: Globals and Constants passed cleanly")
+    return 0
+}

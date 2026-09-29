@@ -1,0 +1,59 @@
+package main
+
+extern func puts(s *i8) i32
+
+func main() int {
+    puts("=== Test 12: Type Casts & Low-level Representation ===")
+
+    // 1. Truncation casts
+    var big int = 300
+    b := u8(big)
+    if int(b) != 44 { return 1 } // 300 & 0xFF == 44
+
+    var big16 int = 70000
+    w := u16(big16)
+    if int(w) != 4464 { return 2 } // 70000 & 0xFFFF == 4464
+
+    var big32 int = 5000000000
+    dw := u32(big32)
+    // 5000000000 & 0xFFFFFFFF == 705032704
+    if int(dw) != 705032704 { return 3 }
+
+    // 2. Widening casts
+    var small u8 = u8(250)
+    var widened int = int(small)
+    if widened != 250 { return 4 }
+
+    // 3. Pointer and uintptr roundtrip
+    var value int = 123456
+    p := &value
+    u := uintptr(p)
+    p2 := (*int)(u)
+    if *p2 != 123456 { return 5 }
+
+    // 4. Memory inspection via byte pointer (Little-endian test)
+    var test_word int = 305419896 // 0x12345678
+    byte_ptr := (*u8)(uintptr(&test_word))
+    // On x86_64 little endian:
+    // byte 0: 0x78 = 120
+    // byte 1: 0x56 = 86
+    // byte 2: 0x34 = 52
+    // byte 3: 0x12 = 18
+    b0 := int(*((*u8)(uintptr(byte_ptr) + 0)))
+    b1 := int(*((*u8)(uintptr(byte_ptr) + 1)))
+    b2 := int(*((*u8)(uintptr(byte_ptr) + 2)))
+    b3 := int(*((*u8)(uintptr(byte_ptr) + 3)))
+
+    if b0 != 120 { return 6 }
+    if b1 != 86  { return 7 }
+    if b2 != 52  { return 8 }
+    if b3 != 18  { return 9 }
+
+    // 5. In-place byte modification via pointer
+    *((*u8)(uintptr(byte_ptr) + 0)) = u8(0)
+    // Now test_word has 0 in least significant byte: 0x12345600 = 305419776
+    if test_word != 305419776 { return 10 }
+
+    puts("[PASS] Test 12: Type Casts & Low-level Representation passed cleanly")
+    return 0
+}

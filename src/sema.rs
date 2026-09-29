@@ -161,11 +161,77 @@ impl Sema {
         types.insert("f64".to_string(), Type::F64);
         types.insert("string".to_string(), Type::String);
 
+        let mut funcs = HashMap::new();
+        funcs.insert(
+            "printf".to_string(),
+            FuncType {
+                params: vec![Type::Pointer(Box::new(Type::I8))],
+                ret_type: Box::new(Type::I32),
+                is_variadic: true,
+            },
+        );
+        funcs.insert(
+            "puts".to_string(),
+            FuncType {
+                params: vec![Type::Pointer(Box::new(Type::I8))],
+                ret_type: Box::new(Type::I32),
+                is_variadic: false,
+            },
+        );
+        funcs.insert(
+            "exit".to_string(),
+            FuncType {
+                params: vec![Type::I32],
+                ret_type: Box::new(Type::Void),
+                is_variadic: false,
+            },
+        );
+        funcs.insert(
+            "malloc".to_string(),
+            FuncType {
+                params: vec![Type::Usize],
+                ret_type: Box::new(Type::Pointer(Box::new(Type::U8))),
+                is_variadic: false,
+            },
+        );
+        funcs.insert(
+            "free".to_string(),
+            FuncType {
+                params: vec![Type::Pointer(Box::new(Type::U8))],
+                ret_type: Box::new(Type::Void),
+                is_variadic: false,
+            },
+        );
+        funcs.insert(
+            "memcpy".to_string(),
+            FuncType {
+                params: vec![
+                    Type::Pointer(Box::new(Type::U8)),
+                    Type::Pointer(Box::new(Type::U8)),
+                    Type::Usize,
+                ],
+                ret_type: Box::new(Type::Pointer(Box::new(Type::U8))),
+                is_variadic: false,
+            },
+        );
+        funcs.insert(
+            "memset".to_string(),
+            FuncType {
+                params: vec![
+                    Type::Pointer(Box::new(Type::U8)),
+                    Type::I32,
+                    Type::Usize,
+                ],
+                ret_type: Box::new(Type::Pointer(Box::new(Type::U8))),
+                is_variadic: false,
+            },
+        );
+
         Self {
             types,
             structs: HashMap::new(),
             methods: HashMap::new(),
-            funcs: HashMap::new(),
+            funcs,
             globals: HashMap::new(),
             scopes: Vec::new(),
             current_ret_type: None,
@@ -275,69 +341,81 @@ impl Sema {
             }
         }
 
-        // Pass 2: Resolve struct field types and compute layouts
-        for decl in &program.decls {
-            if let Decl::TypeDecl { name, def, span: _ } = decl {
-                match def {
-                    TypeDef::Struct { fields, attributes } => {
-                        let is_packed = attributes.contains(&Attribute::Packed);
-                        let mut explicit_align = None;
-                        for attr in attributes {
-                            if let Attribute::Align(n) = attr {
-                                explicit_align = Some(*n);
+        // Pass 2: Resolve struct field types and compute layouts iteratively
+        for _ in 0..16 {
+            let mut changed = false;
+            for decl in &program.decls {
+                if let Decl::TypeDecl { name, def, span: _ } = decl {
+                    match def {
+                        TypeDef::Struct { fields, attributes } => {
+                            let is_packed = attributes.contains(&Attribute::Packed);
+                            let mut explicit_align = None;
+                            for attr in attributes {
+                                if let Attribute::Align(n) = attr {
+                                    explicit_align = Some(*n);
+                                }
                             }
+
+                            let mut resolved_fields = Vec::new();
+                            let mut current_offset = 0;
+                            let mut max_align = explicit_align.unwrap_or(1);
+
+                            for f in fields {
+                                let field_ty = self.resolve_type_node(&f.ty)?;
+                                let f_align = if is_packed { 1 } else { field_ty.align_of() };
+                                if f_align > max_align {
+                                    max_align = f_align;
+                                }
+
+                                if !is_packed && f_align > 0 {
+                                    let padding = (f_align - (current_offset % f_align)) % f_align;
+                                    current_offset += padding;
+                                }
+
+                                let offset = current_offset;
+                                current_offset += field_ty.size_of();
+
+                                resolved_fields.push(StructFieldType {
+                                    name: f.name.clone(),
+                                    ty: field_ty,
+                                    offset,
+                                });
+                            }
+
+                            let total_size = if !is_packed && max_align > 0 {
+                                let pad = (max_align - (current_offset % max_align)) % max_align;
+                                current_offset + pad
+                            } else {
+                                current_offset
+                            };
+
+                            let prev_size = self.structs.get(name).map(|s| s.total_size).unwrap_or(0);
+                            let prev_field_count = self.structs.get(name).map(|s| s.fields.len()).unwrap_or(0);
+                            if prev_size != total_size || prev_field_count != resolved_fields.len() {
+                                changed = true;
+                            }
+
+                            let finalized = StructType {
+                                name: name.clone(),
+                                fields: resolved_fields,
+                                is_packed,
+                                explicit_align,
+                                total_size,
+                                alignment: max_align,
+                            };
+
+                            self.structs.insert(name.clone(), finalized.clone());
+                            self.types.insert(name.clone(), Type::Struct(finalized));
                         }
-
-                        let mut resolved_fields = Vec::new();
-                        let mut current_offset = 0;
-                        let mut max_align = explicit_align.unwrap_or(1);
-
-                        for f in fields {
-                            let field_ty = self.resolve_type_node(&f.ty)?;
-                            let f_align = if is_packed { 1 } else { field_ty.align_of() };
-                            if f_align > max_align {
-                                max_align = f_align;
-                            }
-
-                            if !is_packed && f_align > 0 {
-                                let padding = (f_align - (current_offset % f_align)) % f_align;
-                                current_offset += padding;
-                            }
-
-                            let offset = current_offset;
-                            current_offset += field_ty.size_of();
-
-                            resolved_fields.push(StructFieldType {
-                                name: f.name.clone(),
-                                ty: field_ty,
-                                offset,
-                            });
+                        TypeDef::Alias(ty_node) => {
+                            let resolved = self.resolve_type_node(ty_node)?;
+                            self.types.insert(name.clone(), resolved);
                         }
-
-                        let total_size = if !is_packed && max_align > 0 {
-                            let pad = (max_align - (current_offset % max_align)) % max_align;
-                            current_offset + pad
-                        } else {
-                            current_offset
-                        };
-
-                        let finalized = StructType {
-                            name: name.clone(),
-                            fields: resolved_fields,
-                            is_packed,
-                            explicit_align,
-                            total_size,
-                            alignment: max_align,
-                        };
-
-                        self.structs.insert(name.clone(), finalized.clone());
-                        self.types.insert(name.clone(), Type::Struct(finalized));
-                    }
-                    TypeDef::Alias(ty_node) => {
-                        let resolved = self.resolve_type_node(ty_node)?;
-                        self.types.insert(name.clone(), resolved);
                     }
                 }
+            }
+            if !changed {
+                break;
             }
         }
 
@@ -1020,8 +1098,119 @@ impl Sema {
                     }
                 }
 
-                // Check if callee is a method call: `recv.Method(...)`
+                // Check if callee is a package call or a method call: `recv.Method(...)`
                 if let Expr::MemberAccess(ref target, ref method_name, _) = *callee {
+                    if let Expr::Ident(ref pkg_name, _) = **target {
+                        if self.lookup_var(pkg_name).is_none() {
+                            let candidate_names = [
+                                format!("{}_{}", pkg_name, method_name),
+                                method_name.clone(),
+                                if pkg_name == "fmt" && method_name == "Printf" { "printf".to_string() } else { "".to_string() },
+                                if pkg_name == "fmt" && method_name == "Println" { "Println".to_string() } else { "".to_string() },
+                                if pkg_name == "fmt" && method_name == "Print" { "Print".to_string() } else { "".to_string() },
+                                if pkg_name == "fmt" && (method_name == "Scanf" || method_name == "Scan" || method_name == "Scanln") {
+                                    if self.funcs.contains_key("fmt_Scanln") {
+                                        "fmt_Scanln".to_string()
+                                    } else if self.funcs.contains_key("Scanln") {
+                                        "Scanln".to_string()
+                                    } else if self.funcs.contains_key("scanf") {
+                                        "scanf".to_string()
+                                    } else {
+                                        "".to_string()
+                                    }
+                                } else {
+                                    "".to_string()
+                                },
+                                if pkg_name == "os" && method_name == "Exit" { "exit".to_string() } else { "".to_string() },
+                            ];
+
+                            let mut resolved_func = None;
+                            for cand in &candidate_names {
+                                if !cand.is_empty() && self.funcs.contains_key(cand) {
+                                    resolved_func = Some(cand.clone());
+                                    break;
+                                }
+                            }
+                            if resolved_func.is_none() && pkg_name == "fmt" && method_name == "Println" {
+                                if self.funcs.contains_key("puts") {
+                                    resolved_func = Some("puts".to_string());
+                                }
+                            }
+
+                            if let Some(func_name) = resolved_func {
+                                let func_sig = self.funcs.get(&func_name).cloned().unwrap();
+                                if func_sig.is_variadic {
+                                    if args.len() < func_sig.params.len() {
+                                        return Err(format!(
+                                            "Variadic function '{}.{}' expects at least {} arguments, but got {} at {}",
+                                            pkg_name, method_name, func_sig.params.len(), args.len(), s
+                                        ));
+                                    }
+                                } else if func_sig.params.len() != args.len() {
+                                    return Err(format!(
+                                        "Function '{}.{}' expects {} arguments, but got {} at {}",
+                                        pkg_name, method_name, func_sig.params.len(), args.len(), s
+                                    ));
+                                }
+
+                                let mut checked_args = Vec::new();
+                                for (i, arg_expr) in args.into_iter().enumerate() {
+                                    let mut a = self.check_expr(arg_expr)?;
+                                    if i < func_sig.params.len() {
+                                        let param_ty = &func_sig.params[i];
+                                        if a.ty != *param_ty {
+                                            if self.can_coerce(&a.ty, param_ty) {
+                                                a = self.coerce_expr(a, param_ty.clone());
+                                            } else {
+                                                return Err(format!(
+                                                    "Argument of type '{}' does not match expected parameter type '{}' in call to '{}.{}' at {}",
+                                                    a.ty, param_ty, pkg_name, method_name, s
+                                                ));
+                                            }
+                                        }
+                                    } else if a.ty == Type::String {
+                                        a = self.coerce_expr(a, Type::Pointer(Box::new(Type::I8)));
+                                    } else if a.ty == Type::I8 || a.ty == Type::I16 {
+                                        a = self.coerce_expr(a, Type::I32);
+                                    } else if a.ty == Type::U8 || a.ty == Type::U16 {
+                                        a = self.coerce_expr(a, Type::U32);
+                                    } else if a.ty == Type::F32 {
+                                        a = self.coerce_expr(a, Type::F64);
+                                    } else {
+                                        let elem_opt = match a.ty {
+                                            Type::Pointer(ref inner) => match **inner {
+                                                Type::Array(ref elem, _) => Some(elem.clone()),
+                                                _ => None,
+                                            },
+                                            _ => None,
+                                        };
+                                        if let Some(elem) = elem_opt {
+                                            a = self.coerce_expr(a, Type::Pointer(elem));
+                                        }
+                                    }
+                                    checked_args.push(a);
+                                }
+
+                                // Universal %d support: rewrite %d to %lld for 64-bit integer arguments in Printf
+                                if (func_name == "printf" || func_name == "fmt_Printf" || (pkg_name == "fmt" && method_name == "Printf"))
+                                    && !checked_args.is_empty()
+                                {
+                                    self.rewrite_printf_format(&mut checked_args);
+                                }
+
+                                return Ok(TypedExpr {
+                                    kind: TypedExprKind::Call {
+                                        func_name,
+                                        args: checked_args,
+                                    },
+                                    ty: *func_sig.ret_type,
+                                    span: s,
+                                });
+                            }
+                        }
+                    }
+
+                    // 2. Struct method call
                     let typed_target = self.check_expr(*target.clone())?;
                     let (type_name, is_ptr) = match &typed_target.ty {
                         Type::Pointer(inner) => match &**inner {
@@ -1119,8 +1308,30 @@ impl Sema {
                         }
                     } else if a.ty == Type::String {
                         a = self.coerce_expr(a, Type::Pointer(Box::new(Type::I8)));
+                    } else if a.ty == Type::I8 || a.ty == Type::I16 {
+                        a = self.coerce_expr(a, Type::I32);
+                    } else if a.ty == Type::U8 || a.ty == Type::U16 {
+                        a = self.coerce_expr(a, Type::U32);
+                    } else if a.ty == Type::F32 {
+                        a = self.coerce_expr(a, Type::F64);
+                    } else {
+                        let elem_opt = match a.ty {
+                            Type::Pointer(ref inner) => match **inner {
+                                Type::Array(ref elem, _) => Some(elem.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(elem) = elem_opt {
+                            a = self.coerce_expr(a, Type::Pointer(elem));
+                        }
                     }
                     checked_args.push(a);
+                }
+
+                // Universal %d support: rewrite %d to %lld for 64-bit integer arguments in printf
+                if (func_name == "printf" || func_name == "fmt_Printf") && !checked_args.is_empty() {
+                    self.rewrite_printf_format(&mut checked_args);
                 }
 
                 Ok(TypedExpr {
@@ -1384,6 +1595,16 @@ impl Sema {
         if from.is_pointer() && to.is_pointer() {
             return true;
         }
+        // Pointer to array to pointer to element: *[N]T -> *T
+        if let Type::Pointer(ref from_inner) = from {
+            if let Type::Array(ref elem, _) = **from_inner {
+                if let Type::Pointer(ref to_inner) = to {
+                    if **elem == **to_inner {
+                        return true;
+                    }
+                }
+            }
+        }
         false
     }
 
@@ -1399,6 +1620,131 @@ impl Sema {
             },
             ty: target_ty,
             span,
+        }
+    }
+
+    fn rewrite_printf_format(&self, checked_args: &mut [TypedExpr]) {
+        if checked_args.is_empty() {
+            return;
+        }
+        let maybe_fmt_str = match &checked_args[0].kind {
+            TypedExprKind::StringLit(s) => Some((s.clone(), false)),
+            TypedExprKind::Cast { expr: inner, .. } => match &inner.kind {
+                TypedExprKind::StringLit(s) => Some((s.clone(), true)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((fmt_str, was_cast)) = maybe_fmt_str {
+            let extra_args = &checked_args[1..];
+            let mut new_fmt = String::new();
+            let mut chars = fmt_str.chars().peekable();
+            let mut arg_idx = 0;
+
+            while let Some(ch) = chars.next() {
+                if ch == '%' {
+                    if chars.peek() == Some(&'%') {
+                        new_fmt.push('%');
+                        new_fmt.push(chars.next().unwrap());
+                        continue;
+                    }
+                    let mut prefix = String::new();
+                    let mut spec_char = None;
+                    while let Some(&c) = chars.peek() {
+                        if c.is_alphabetic() {
+                            spec_char = Some(chars.next().unwrap());
+                            break;
+                        } else {
+                            prefix.push(chars.next().unwrap());
+                        }
+                    }
+
+                    if let Some(spec) = spec_char {
+                        if spec == 'd' || spec == 'i' {
+                            if arg_idx < extra_args.len() {
+                                let arg_ty = &extra_args[arg_idx].ty;
+                                if arg_ty.is_unsigned() {
+                                    if arg_ty.size_of() == 8 {
+                                        new_fmt.push('%');
+                                        new_fmt.push_str(&prefix);
+                                        new_fmt.push_str("llu");
+                                    } else {
+                                        new_fmt.push('%');
+                                        new_fmt.push_str(&prefix);
+                                        new_fmt.push('u');
+                                    }
+                                } else {
+                                    if arg_ty.size_of() == 8 {
+                                        new_fmt.push('%');
+                                        new_fmt.push_str(&prefix);
+                                        new_fmt.push_str("lld");
+                                    } else {
+                                        new_fmt.push('%');
+                                        new_fmt.push_str(&prefix);
+                                        new_fmt.push('d');
+                                    }
+                                }
+                            } else {
+                                new_fmt.push('%');
+                                new_fmt.push_str(&prefix);
+                                new_fmt.push(spec);
+                            }
+                        } else if spec == 'u' {
+                            if arg_idx < extra_args.len() {
+                                let arg_ty = &extra_args[arg_idx].ty;
+                                if arg_ty.size_of() == 8 {
+                                    new_fmt.push('%');
+                                    new_fmt.push_str(&prefix);
+                                    new_fmt.push_str("llu");
+                                } else {
+                                    new_fmt.push('%');
+                                    new_fmt.push_str(&prefix);
+                                    new_fmt.push('u');
+                                }
+                            } else {
+                                new_fmt.push('%');
+                                new_fmt.push_str(&prefix);
+                                new_fmt.push('u');
+                            }
+                        } else if spec == 'x' || spec == 'X' {
+                            if arg_idx < extra_args.len() {
+                                let arg_ty = &extra_args[arg_idx].ty;
+                                if arg_ty.size_of() == 8 {
+                                    new_fmt.push('%');
+                                    new_fmt.push_str(&prefix);
+                                    new_fmt.push_str("ll");
+                                    new_fmt.push(spec);
+                                } else {
+                                    new_fmt.push('%');
+                                    new_fmt.push_str(&prefix);
+                                    new_fmt.push(spec);
+                                }
+                            } else {
+                                new_fmt.push('%');
+                                new_fmt.push_str(&prefix);
+                                new_fmt.push(spec);
+                            }
+                        } else {
+                            new_fmt.push('%');
+                            new_fmt.push_str(&prefix);
+                            new_fmt.push(spec);
+                        }
+                        arg_idx += 1;
+                    } else {
+                        new_fmt.push('%');
+                        new_fmt.push_str(&prefix);
+                    }
+                } else {
+                    new_fmt.push(ch);
+                }
+            }
+            if was_cast {
+                if let TypedExprKind::Cast { ref mut expr, .. } = checked_args[0].kind {
+                    expr.kind = TypedExprKind::StringLit(new_fmt);
+                }
+            } else {
+                checked_args[0].kind = TypedExprKind::StringLit(new_fmt);
+            }
         }
     }
 }

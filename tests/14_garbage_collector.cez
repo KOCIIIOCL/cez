@@ -1,0 +1,183 @@
+package main
+
+extern func puts(s *i8) i32
+extern func malloc(size int) *u8
+extern func free(ptr *u8) void
+
+type GCObject struct {
+    ptr    *u8
+    size   int
+    marked bool
+    next   *GCObject
+}
+
+type GC struct {
+    head            *GCObject
+    total_allocated int
+    threshold       int
+    enabled         bool
+    roots           [256]*u8
+    root_count      int
+}
+
+func (gc *GC) Init(threshold int) {
+    gc.head = (*GCObject)(uintptr(0))
+    gc.total_allocated = 0
+    gc.threshold = threshold
+    gc.enabled = true
+    gc.root_count = 0
+}
+
+func (gc *GC) AddRoot(root *u8) {
+    if gc.root_count < 256 {
+        gc.roots[gc.root_count] = root
+        gc.root_count += 1
+    }
+}
+
+func (gc *GC) RemoveRoot(root *u8) {
+    var i int = 0
+    for i < gc.root_count {
+        if gc.roots[i] == root {
+            gc.roots[i] = gc.roots[gc.root_count - 1]
+            gc.root_count -= 1
+            return
+        }
+        i += 1
+    }
+}
+
+func (gc *GC) Alloc(size int) *u8 {
+    if gc.enabled && gc.total_allocated + size > gc.threshold {
+        gc.Collect()
+    }
+
+    raw := malloc(size)
+    if uintptr(raw) == 0 {
+        return (*u8)(uintptr(0))
+    }
+
+    hdr_mem := malloc(32)
+    obj := (*GCObject)(uintptr(hdr_mem))
+    obj.ptr = raw
+    obj.size = size
+    obj.marked = false
+    obj.next = gc.head
+    gc.head = obj
+
+    gc.total_allocated += size
+    return raw
+}
+
+func (gc *GC) Collect() int {
+    if !gc.enabled {
+        return 0
+    }
+
+    // 1. Mark phase
+    var r_idx int = 0
+    for r_idx < gc.root_count {
+        root_ptr := gc.roots[r_idx]
+        curr := gc.head
+        for uintptr(curr) != 0 {
+            if curr.ptr == root_ptr {
+                curr.marked = true
+            }
+            curr = curr.next
+        }
+        r_idx += 1
+    }
+
+    // 2. Sweep phase
+    var freed_bytes int = 0
+    var prev *GCObject = (*GCObject)(uintptr(0))
+    curr := gc.head
+
+    for uintptr(curr) != 0 {
+        next_obj := curr.next
+        if !curr.marked {
+            if uintptr(prev) == 0 {
+                gc.head = next_obj
+            } else {
+                prev.next = next_obj
+            }
+            freed_bytes += curr.size
+            gc.total_allocated -= curr.size
+            free(curr.ptr)
+            free((*u8)(uintptr(curr)))
+        } else {
+            curr.marked = false
+            prev = curr
+        }
+        curr = next_obj
+    }
+
+    return freed_bytes
+}
+
+func (gc *GC) ObjectCount() int {
+    var count int = 0
+    curr := gc.head
+    for uintptr(curr) != 0 {
+        count += 1
+        curr = curr.next
+    }
+    return count
+}
+
+func (gc *GC) BytesUsed() int {
+    return gc.total_allocated
+}
+
+func main() int {
+    puts("=== Test 14: Opt-in Garbage Collector ===")
+
+    var gc GC
+    gc.Init(100) // 100-byte collection threshold
+
+    // 1. Initial state
+    if gc.BytesUsed() != 0 { return 1 }
+    if gc.ObjectCount() != 0 { return 2 }
+
+    // 2. Allocate 3 blocks of 30 bytes
+    p1 := gc.Alloc(30)
+    p2 := gc.Alloc(30)
+    p3 := gc.Alloc(30)
+
+    if gc.BytesUsed() != 90 { return 3 }
+    if gc.ObjectCount() != 3 { return 4 }
+
+    // Write identifying data into p1, p2, p3
+    *((*int)(uintptr(p1))) = 111
+    *((*int)(uintptr(p2))) = 222
+    *((*int)(uintptr(p3))) = 333
+
+    // 3. Mark p1 and p3 as live roots, leaving p2 unreachable (garbage)
+    gc.AddRoot(p1)
+    gc.AddRoot(p3)
+
+    // 4. Allocating 40 bytes will exceed threshold (90 + 40 = 130 > 100),
+    // triggering automatic GC collection: p2 is swept, freeing 30 bytes.
+    p4 := gc.Alloc(40)
+    *((*int)(uintptr(p4))) = 444
+
+    // Remaining objects: p1 (30b), p3 (30b), p4 (40b) = 100 bytes, 3 objects
+    if gc.BytesUsed() != 100 { return 5 }
+    if gc.ObjectCount() != 3 { return 6 }
+
+    // Verify surviving objects preserved their data
+    if *((*int)(uintptr(p1))) != 111 { return 7 }
+    if *((*int)(uintptr(p3))) != 333 { return 8 }
+    if *((*int)(uintptr(p4))) != 444 { return 9 }
+
+    // 5. Explicitly free everything by removing all roots
+    gc.RemoveRoot(p1)
+    gc.RemoveRoot(p3)
+    freed := gc.Collect()
+    if freed != 100 { return 10 }
+    if gc.BytesUsed() != 0 { return 11 }
+    if gc.ObjectCount() != 0 { return 12 }
+
+    puts("[PASS] Test 14: Opt-in Garbage Collector passed cleanly")
+    return 0
+}

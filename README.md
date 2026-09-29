@@ -1,213 +1,132 @@
-# Cez Programming Language
+<p align="center">
+  <img src="assets/logo.png" width="220" alt="Cez Logo" />
+</p>
 
-**Cez** — это системный язык программирования со знакомым, чистым и эргономичным синтаксисом **Go**, оптимизированный для:
-1. **OSDev (первоклассный режим "лучший из лучших")**: нативная поддержка bare-metal/freestanding ядер, `@packed` структур для аппаратных дескрипторов (IDT, GDT, TSS, Page Tables), `@align(N)`, размещения данных в ELF-секциях (`@section(".multiboot")`), `@naked` функций без прологов и эпилогов для прерываний и переключения контекста, прямого ассемблера `inline_asm`, volatile операций для MMIO и кастомных аллокаторов.
-2. **Низкоуровневых высокопроизводительных серверов**: zero-cost слайсы `[]T` без неявных копирований, быстрые арены памяти, `defer` для предсказуемой очистки ресурсов, прямой доступ к сокетам и системным вызовам без лишних уровней абстракций.
-3. **Бытовых легких утилит и TUI**: лаконичный синтаксис Go (`:=`, `defer`, методы на структурах, срезы строк, ANSI эскейп-коды).
-4. **Бэкенд на LLVM**: генерация переносимого, чистого LLVM IR с использованием мощных оптимизаторов (`-O1` .. `-O3`) и компоновщика LLD.
-5. **Управление памятью**:
-   - По умолчанию: ручное управление памятью, арены памяти и `defer` (нулевой оверхед, отсутствие скрытых пауз).
-   - В перспективе: модульный GC (`--gc=none` по умолчанию, с возможностью подключения tracing GC для высокоуровневых сценариев).
-6. **Подготовка к самохостингу**: компилятор спроектирован модульно (Lexer -> Parser -> AST -> Sema -> LLVM Codegen -> Driver), что обеспечивает простую трансляцию компилятора на сам Cez в будущем.
+<h1 align="center">Язык программирования Cez</h1>
+
+<p align="center">
+  <b>Системный язык нового поколения: лаконичность Go + аппаратная мощь C/Zig + 100% детерминированный самохостинг</b>
+</p>
+
+<p align="center">
+  <a href="docs/LANGUAGE.md">Спецификация языка</a> •
+  <a href="docs/OSDEV.md">Руководство по OSDev</a> •
+  <a href="docs/BENCHMARKS_AND_COMPARISON.md">Сравнение и 10 Топов</a>
+</p>
 
 ---
 
-## Установка и сборка
+## О языке Cez
 
-Компилятор Cez не требует внешних зависимостей кроме Rust (для начальной сборки) и системного Clang/LLVM.
+**Cez** создавался с главной целью: дать разработчикам **удовольствие и скорость написания кода уровня Go**, но без скрытых пауз сборщика мусора, без навязанного рантайма и с абсолютным аппаратным контролем, необходимым для **разработки операционных систем (OSDev)**, гипервизоров, драйверов и экстремально быстрых серверов.
 
+### Ключевые преимущества:
+1. **Эргономика Go**: вывод типов (`:=`), отсутствие круглых скобок в `if`/`for`, автоматические точки с запятой (ASI), чистый LIFO `defer` для освобождения ресурсов, структуры с методами `(p *Point) Move(...)`.
+2. **Первоклассный OSDev / Bare-Metal**:
+   - `@packed` структуры для аппаратных таблиц (IDT, GDT, TSS, Page Tables).
+   - `@align(N)` для выравнивания страниц (4096 байт).
+   - `@section(".multiboot")` для размещения данных в секциях ELF.
+   - `@naked` функции без прологов/эпилогов для прерываний и переключения контекста.
+   - `inline_asm` и прямой доступ к MMIO/VGA памяти (`0xB8000`).
+3. **Числа с плавающей точкой**: нативная поддержка `f32` (float) и `f64` (double), математических выражений и приведений типов.
+4. **Гибридная модель памяти**:
+   - Стек (нулевой оверхед).
+   - Быстрые bump-арены памяти `O(1)` ([`core/mem.cez`](core/mem.cez)).
+   - Прямое управление памятью (`malloc` / `free`).
+   - Опциональный сборщик мусора ([`core/gc.cez`](core/gc.cez)), включенный по умолчанию для прикладного софта и отключаемый для ядра ОС.
+5. **100% Self-Hosting**: компилятор полностью написан на самом Cez и компилирует сам себя бит-в-бит (Stage 2 = Stage 3 детерминированно).
+6. **Локализация CLI (i18n)**: полная поддержка вывода всех команд компилятора на 3 языках: **английский** (`en`), **русский** (`ru`) и **украинский** (`uk`) — автоопределение по системной локали, `$CEZ_LANG` или флагу `--lang=<en|ru|uk>`.
+7. **Инструменты разработчика**: встроенный легковесный LSP-сервер (`cez lsp`) и расширение для редактора **Zed** ([`editors/zed/`](editors/zed/)).
+
+---
+
+## Быстрый старт
+
+### Сборка компилятора:
 ```bash
-# Сборка компилятора
+# Начальный бутстрап через Rust:
 cargo build --release
 
-# Бинарник компилятора находится в:
-./target/release/cez --help
+# Сборка самохостящегося компилятора bin/cez:
+cargo run --release -- build core/mem.cez core/os.cez compiler/*.cez -o bin/cez-stage1
+./bin/cez-stage1 core/mem.cez core/os.cez compiler/*.cez -o bin/cez
 ```
 
----
-
-## Быстрый старт и CLI
-
+### Запуск примеров:
 ```bash
-# Скомпилировать и сразу запустить программу
-cez run examples/hello.cez
+# Приветственный пример с defer и функциями
+./bin/cez examples/hello.cez -o /tmp/hello && /tmp/hello
 
-# Запустить серверный пример парсинга сетевых пакетов
-cez run examples/server_packet.cez
+# Сетевой серверный парсер пакетов с @packed
+./bin/cez examples/server_packet.cez -o /tmp/packet && /tmp/packet
 
-# Запустить интерактивную TUI панель мониторинга
-cez run examples/tui_dashboard.cez
+# TUI-интерфейс мониторинга
+./bin/cez examples/tui_dashboard.cez -o /tmp/tui && /tmp/tui
 
-# Скомпилировать baremetal ядро ОС с Multiboot-заголовком без libc
-cez build examples/kernel_multiboot.cez --freestanding -o kernel.o
-
-# Проверить секции ядра
-readelf -S kernel.o
-
-# Сгенерировать чистый LLVM IR (.ll)
-cez emit-llvm examples/hello.cez -o hello.ll
+# Сборка Bare-Metal Multiboot ядра ОС без libc
+./bin/cez examples/kernel_multiboot.cez -o /tmp/kernel.o
 ```
 
 ---
 
-## Синтаксис и возможности языка
+## Пример кода на Cez
 
-### 1. Базовый синтаксис в стиле Go
 ```go
 package main
 
 extern func puts(s *i8) i32
-
-func main() int {
-    defer puts("Deferred: executed in LIFO order at exit!")
-
-    puts("Hello from Cez!")
-
-    var a int = 20
-    b := 22
-    sum := a + b
-
-    if sum == 42 {
-        puts("Math check passed: 20 + 22 = 42")
-    }
-
-    return 0
-}
-```
-
-### 2. Структуры, методы и `@packed` для сетевых протоколов и серверов
-```go
-package main
-
 extern func printf(fmt *i8, ...) i32
 
-// Сетевой заголовок без padding-байтов
-type PacketHeader struct @packed {
-    magic       u16
-    version     u8
-    opcode      u8
-    payload_len u32
+type Vector2 struct {
+    x f64
+    y f64
 }
 
-func (h *PacketHeader) IsValid() bool {
-    return h.magic == 0x5054 && h.version == 1
-}
-
-func (h *PacketHeader) Summary() {
-    printf("Packet[magic=0x%04X, ver=%d, size=%u bytes]\n", 
-           u32(h.magic), u32(h.version), h.payload_len)
+func (v *Vector2) LengthSq() f64 {
+    return v.x * v.x + v.y * v.y
 }
 
 func main() int {
-    var hdr PacketHeader = PacketHeader{
-        magic: 0x5054,
-        version: 1,
-        opcode: 7,
-        payload_len: 1024,
-    }
+    defer puts("Выполнено гарантированно в порядке LIFO!")
 
-    if hdr.IsValid() {
-        hdr.Summary()
+    v := Vector2{ x: 3.0, y: 4.0 }
+    lsq := v.LengthSq() // 25.0
+
+    if lsq == 25.0 {
+        puts("[OK] Расчет длины вектора через f64 прошел успешно")
     }
 
     return 0
 }
 ```
 
-### 3. OSDev: Multiboot, прерывания, `@naked`, MMIO и inline ассемблер
-```go
-package main
+---
 
-// Multiboot 1 заголовок, помещаемый в секцию .multiboot с выравниванием 4 байта
-type MultibootHeader struct @packed {
-    magic    u32
-    flags    u32
-    checksum u32
-}
+## Тестовый набор компилятора (14 тестов)
 
-var mb_header MultibootHeader @section(".multiboot") @align(4) = MultibootHeader{
-    magic: 0x1BADB002,
-    flags: 0x00000003,
-    checksum: 0xE4524FFB,
-}
+Все тесты компилируются самохостящимся компилятором `bin/cez` и проходят со статусом PASS:
 
-// Таблица IDT дескрипторов прерываний
-type IDTEntry struct @packed {
-    offset_low  u16
-    selector    u16
-    ist         u8
-    type_attr   u8
-    offset_mid  u16
-    offset_high u32
-    reserved    u32
-}
-
-var idt_table [256]IDTEntry @align(4096)
-
-// Порты ввода-вывода через встроенный ассемблер
-func outb(port u16, val u8) {
-    inline_asm("outb %0, %1" : : "{al}"(val), "{dx}"(port))
-}
-
-// Naked функция для обработчика прерывания
-func isr_keyboard() @naked {
-    inline_asm("cli")
-    outb(0x20, 0x20)
-    inline_asm("iretq")
-}
-
-// Точка входа ядра без пролога/эпилога
-func kernel_entry() @export("_start") @naked {
-    inline_asm("cli")
-
-    // Прямая запись в текстовый буфер VGA (MMIO 0xB8000)
-    vga := (*u16)(uintptr(0xb8000))
-    @volatile_store(vga, u16(0x0A43)) // 'C' зеленым цветом
-
-    inline_asm("hlt")
-}
-```
-
-### 4. Арены памяти (`core/mem.cez`)
-```go
-// Инициализация легковесной арены
-var arena Arena
-arena.Init(buffer, 1024 * 1024) // 1MB
-defer arena.Reset()
-
-ptr := arena.Alloc(256)
-```
+| Тест | Описание |
+|---|---|
+| [`tests/01_arithmetic.cez`](tests/01_arithmetic.cez) | Целочисленная арифметика и побитовые операции (`&`, `\|`, `^`, `<<`, `>>`) |
+| [`tests/02_control_flow.cez`](tests/02_control_flow.cez) | Ветвления `if` / `else if` / `else`, логические операции |
+| [`tests/03_loops.cez`](tests/03_loops.cez) | Циклы `for` (3-секционные, while-стиль, бесконечные, `break`, `continue`) |
+| [`tests/04_functions.cez`](tests/04_functions.cez) | Функции, рекурсия (факториал, Фибоначчи, Аккерман) |
+| [`tests/05_structs.cez`](tests/05_structs.cez) | Структуры, вложенные поля, методы с receiver-указателем |
+| [`tests/06_pointers.cez`](tests/06_pointers.cez) | Указатели `*p`, `&x`, swap, двойные указатели `**pp`, `uintptr` |
+| [`tests/07_arrays.cez`](tests/07_arrays.cez) | Статические массивы `[10]int`, индексация, in-place реверс |
+| [`tests/08_strings.cez`](tests/08_strings.cez) | Строковые литералы, escape-последовательности, `StrLen`, `StrEq` |
+| [`tests/09_defer.cez`](tests/09_defer.cez) | LIFO вызов `defer`, ранний `return` |
+| [`tests/10_globals_and_consts.cez`](tests/10_globals_and_consts.cez) | Глобальные переменные `var`, константы `const`, затенение |
+| [`tests/11_memory_arena.cez`](tests/11_memory_arena.cez) | Арена памяти, связный список, выравнивание, сброс арены |
+| [`tests/12_type_casts.cez`](tests/12_type_casts.cez) | Приведения типов (`u8`, `u16`, `u32`, `int`, `uintptr`), little-endian |
+| [`tests/13_floating_point.cez`](tests/13_floating_point.cez) | Вещественные числа `f32` и `f64`, арифметика, сравнения, касты |
+| [`tests/14_garbage_collector.cez`](tests/14_garbage_collector.cez) | Опциональный Mark-and-Sweep сборщик мусора ([`core/gc.cez`](core/gc.cez)) |
 
 ---
 
-## Архитектура компилятора
+## Документация проекта
 
-```
-cez/
-├── src/
-│   ├── main.rs              # CLI утилита (build, run, check, emit-llvm)
-│   ├── token.rs             # Токены, ключевые слова, спаны, ASI
-│   ├── lexer.rs             # Лексический анализатор (авто-вставка точек с запятой)
-│   ├── ast.rs               # Синтаксическое дерево (Go AST + OSDev атрибуты)
-│   ├── parser.rs            # Рекурсивный спуск + Pratt parser для выражений
-│   ├── types.rs             # Типизация (числа, структуры, указатели, слайсы, функции)
-│   ├── sema.rs              # Семантический анализ, вывод типов, валидация OSDev
-│   ├── codegen/
-│   │   ├── mod.rs
-│   │   └── llvm_ir.rs       # Генератор оптимизированного LLVM IR
-│   └── driver.rs            # Оркестрация вызовов Clang/LLVM/LLD
-├── core/
-│   └── mem.cez              # Арены памяти, memcpy, memset
-├── examples/
-│   ├── hello.cez            # Базовый пример + defer
-│   ├── server_packet.cez    # Сетевой серверный протокол + @packed
-│   ├── kernel_multiboot.cez # OSDev ядро с Multiboot, IDT, MMIO, naked
-│   └── tui_dashboard.cez    # Консольный TUI дашборд
-└── tests/
-    └── integration_tests.rs # E2E интеграционные тесты
-```
-
----
-
-## Лицензия
-MIT
+* **[Спецификация языка (docs/LANGUAGE.md)](docs/LANGUAGE.md)** — полное описание синтаксиса, типов и семантики.
+* **[Разработка ОС (docs/OSDEV.md)](docs/OSDEV.md)** — создание загрузчиков, IDT/GDT, обработчиков прерываний и MMIO.
+* **[Сравнение и 10 Топов (docs/BENCHMARKS_AND_COMPARISON.md)](docs/BENCHMARKS_AND_COMPARISON.md)** — детальный анализ преимуществ Cez перед C, C++, Rust, Zig, Odin, Go.

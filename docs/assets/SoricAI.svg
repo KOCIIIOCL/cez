@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="210mm"
+   height="297mm"
+   viewBox="0 0 210 297"
+   version="1.1"
+   id="svg1"
+   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
+   sodipodi:docname="SoricAI.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns:xlink="http://www.w3.org/1999/xlink"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:document-units="mm"
+     inkscape:zoom="1.2070312"
+     inkscape:cx="441.16505"
+     inkscape:cy="499.98706"
+     inkscape:window-width="1808"
+     inkscape:window-height="1018"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="layer1" />
+  <defs
+     id="defs1">
+    <rect
+       x="557.56634"
+       y="472.23301"
+       width="95.68932"
+       height="97.760518"
+       id="rect5" />
+    <rect
+       x="350.90803"
+       y="653.77857"
+       width="223.78442"
+       height="347.3931"
+       id="rect4" />
+  </defs>
+  <g
+     inkscape:label="Слой 1"
+     inkscape:groupmode="layer"
+     id="layer1">
+    <ellipse
+       style="fill:#0b2817;stroke-width:0.471196"
+       id="path1"
+       cx="108.31582"
+       cy="139.48694"
+       rx="68.315819"
+       ry="69.486946" />
+    <path
+       style="fill:#ffffff;stroke-width:0.33223"
+       d="m 56.286217,100.437 0.09888,37.13675 10.429033,20.49995 29.446694,-3.45782 11.036466,-39.20235 37.72821,21.0143 19.34621,-6.78161 -7.50304,-19.95546 -14.48623,-23.086289 -38.48823,-4.30925 z"
+       id="path2"
+       sodipodi:nodetypes="ccccccccccc" />
+    <text
+       xml:space="preserve"
+       transform="matrix(0.35881219,0,0,0.35661422,-33.038529,-104.71923)"
+       id="text4"
+       style="font-style:italic;font-variant:normal;font-weight:600;font-stretch:normal;font-size:266.667px;font-family:Rubik;-inkscape-font-specification:'Rubik Semi-Bold Italic';writing-mode:lr-tb;direction:ltr;white-space:pre;shape-inside:url(#rect4);fill:#ffffff"><tspan
+         x="350.9082"
+         y="897.5208"
+         id="tspan1">S</tspan></text>
+    <text
+       xml:space="preserve"
+       id="text5"
+       style="font-style:normal;font-variant:normal;font-weight:300;font-stretch:normal;font-size:5.32967px;font-family:Rubik;-inkscape-font-specification:'Rubik Light';writing-mode:lr-tb;direction:ltr;white-space:pre;display:inline;fill:#ffffff;stroke-width:0.730093"
+       transform="translate(-7.233657,30.578641)"><textPath
+         xlink:href="#path7"
+         id="textPath7"><tspan
+           style="font-style:italic;font-variant:normal;font-weight:normal;font-stretch:normal;font-family:Rubik;-inkscape-font-specification:'Rubik Italic';stroke-width:0.730093"
+           id="tspan7">oric</tspan><tspan
+           style="font-style:italic;font-variant:normal;font-weight:500;font-stretch:normal;font-family:Rubik;-inkscape-font-specification:'Rubik Medium Italic';stroke-width:0.730093"
+           id="tspan6">AI</tspan></textPath></text>
+    <path
+       style="display:none;fill:#ffffff;stroke-width:0.264583"
+       d="m 160.56526,161.00367 c 9.86408,-4.71284 13.26171,-20.27616 13.26171,-20.27616 0,0 -2.08242,-1.75362 -6.46645,5.04164 -4.38404,6.79525 -6.79526,15.23452 -6.79526,15.23452 z"
+       id="path7" />
+  </g>
+</svg>

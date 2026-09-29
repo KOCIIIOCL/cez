@@ -1,4 +1,5 @@
 use crate::codegen::llvm_ir::LlvmCodegen;
+use crate::i18n::{self, Lang};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::sema::Sema;
@@ -15,6 +16,7 @@ pub struct CompilerOptions {
     pub target: Option<String>,
     pub emit_llvm: bool,
     pub emit_obj: bool,
+    pub lang: Lang,
 }
 
 impl Default for CompilerOptions {
@@ -27,6 +29,7 @@ impl Default for CompilerOptions {
             target: None,
             emit_llvm: false,
             emit_obj: false,
+            lang: Lang::En,
         }
     }
 }
@@ -38,22 +41,89 @@ impl Driver {
         files: &[PathBuf],
         target_triple: &str,
         is_freestanding: bool,
+        lang: Lang,
     ) -> Result<String, String> {
         if files.is_empty() {
-            return Err("No input files provided".to_string());
+            return Err(i18n::msg_no_input_files(lang).to_string());
+        }
+
+        let mut loaded_files = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<PathBuf> = files.iter().cloned().collect();
+        for f in files {
+            if let Ok(canon) = f.canonicalize() {
+                loaded_files.insert(canon);
+            } else {
+                loaded_files.insert(f.clone());
+            }
         }
 
         let mut merged_program: Option<crate::ast::Program> = None;
 
-        for file in files {
-            let source = fs::read_to_string(file)
-                .map_err(|e| format!("Failed to read file '{}': {}", file.display(), e))?;
+        while let Some(file) = queue.pop_front() {
+            let source = fs::read_to_string(&file)
+                .map_err(|e| i18n::msg_failed_read_file(lang, &file.display().to_string(), &e.to_string()))?;
 
             let mut lexer = Lexer::new(&source);
             let tokens = lexer.tokenize_all()?;
 
             let mut parser = Parser::new(tokens);
             let program = parser.parse_program()?;
+
+            // Check imports to see if any point to .cez files or standard library modules
+            for imp in &program.imports {
+                let mut candidates = Vec::new();
+
+                // CEZ_ROOT environment variable — highest priority for dev/custom installs
+                if let Ok(root) = std::env::var("CEZ_ROOT") {
+                    let root_path = PathBuf::from(&root);
+                    candidates.push(root_path.join(format!("core/{}.cez", imp)));
+                    candidates.push(root_path.join(format!("{}.cez", imp)));
+                    candidates.push(root_path.join(format!("core/{}", imp)));
+                }
+                // Relative to running cez binary (e.g. ~/.local/bin/cez -> ~/.local/lib/cez/core/...)
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Some(exe_dir) = exe.parent() {
+                        candidates.push(exe_dir.join(format!("../lib/cez/core/{}.cez", imp)));
+                        candidates.push(exe_dir.join(format!("../lib/cez/{}.cez", imp)));
+                        candidates.push(exe_dir.join(format!("../core/{}.cez", imp)));
+                        candidates.push(exe_dir.join(format!("core/{}.cez", imp)));
+                    }
+                }
+                // ~/.local/lib/cez/core/ for user-local installs
+                if let Ok(home) = std::env::var("HOME") {
+                    candidates.push(PathBuf::from(format!("{}/.local/lib/cez/core/{}.cez", home, imp)));
+                    candidates.push(PathBuf::from(format!("{}/.local/lib/cez/{}.cez", home, imp)));
+                }
+                // Relative to source file
+                if let Some(parent) = file.parent() {
+                    candidates.push(parent.join(format!("{}.cez", imp)));
+                    candidates.push(parent.join(format!("core/{}.cez", imp)));
+                    candidates.push(parent.join(imp));
+                }
+                // Relative to working directory
+                candidates.push(PathBuf::from(format!("core/{}.cez", imp)));
+                candidates.push(PathBuf::from(format!("core/{}", imp)));
+                candidates.push(PathBuf::from(format!("std/{}.cez", imp)));
+                candidates.push(PathBuf::from(format!("{}.cez", imp)));
+                candidates.push(PathBuf::from(imp));
+
+                // System paths (lowest priority)
+                candidates.push(PathBuf::from(format!("/usr/local/lib/cez/core/{}.cez", imp)));
+                candidates.push(PathBuf::from(format!("/usr/local/lib/cez/{}.cez", imp)));
+                candidates.push(PathBuf::from(format!("/usr/lib/cez/core/{}.cez", imp)));
+                candidates.push(PathBuf::from(format!("/usr/lib/cez/{}.cez", imp)));
+                candidates.push(PathBuf::from(format!("/usr/lib/cez/{}", imp)));
+                for cand in candidates {
+                    if cand.is_file() {
+                        let canon = cand.canonicalize().unwrap_or_else(|_| cand.clone());
+                        if !loaded_files.contains(&canon) {
+                            loaded_files.insert(canon);
+                            queue.push_back(cand);
+                            break;
+                        }
+                    }
+                }
+            }
 
             if let Some(ref mut merged) = merged_program {
                 merged.decls.extend(program.decls);
@@ -81,8 +151,9 @@ impl Driver {
     }
 
     pub fn build(options: CompilerOptions) -> Result<PathBuf, String> {
+        let lang = options.lang;
         if options.input_files.is_empty() {
-            return Err("No input files provided".to_string());
+            return Err(i18n::msg_no_input_files(lang).to_string());
         }
 
         let target_triple = options.target.clone().unwrap_or_else(|| {
@@ -97,6 +168,7 @@ impl Driver {
             &options.input_files,
             &target_triple,
             options.is_freestanding,
+            lang,
         )?;
 
         let primary_file = &options.input_files[0];
@@ -107,7 +179,7 @@ impl Driver {
                 primary_file.with_extension("ll")
             });
             fs::write(&out_path, &llvm_ir)
-                .map_err(|e| format!("Failed to write LLVM IR to '{}': {}", out_path.display(), e))?;
+                .map_err(|e| i18n::msg_failed_write_llvm(lang, &out_path.display().to_string(), &e.to_string()))?;
             return Ok(out_path);
         }
 
@@ -115,7 +187,7 @@ impl Driver {
         let stem = primary_file.file_stem().unwrap().to_str().unwrap();
         let temp_ll_path = std::env::temp_dir().join(format!("cez_{}_{}.ll", stem, std::process::id()));
         fs::write(&temp_ll_path, &llvm_ir)
-            .map_err(|e| format!("Failed to write temporary LLVM IR to '{}': {}", temp_ll_path.display(), e))?;
+            .map_err(|e| i18n::msg_failed_write_llvm(lang, &temp_ll_path.display().to_string(), &e.to_string()))?;
 
         let final_output = options.output_file.clone().unwrap_or_else(|| {
             if options.emit_obj {
@@ -150,28 +222,29 @@ impl Driver {
             cmd.arg("-c");
         }
 
-        let output = cmd.output().map_err(|e| format!("Failed to execute clang: {}", e))?;
+        let output = cmd.output().map_err(|e| i18n::msg_failed_execute_clang(lang, &e.to_string()))?;
 
         // Cleanup temporary .ll file
         let _ = fs::remove_file(&temp_ll_path);
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Clang compilation failed:\n{}", stderr));
+            return Err(i18n::msg_clang_compilation_failed(lang, &stderr));
         }
 
         Ok(final_output)
     }
 
     pub fn run(options: CompilerOptions, run_args: &[String]) -> Result<i32, String> {
+        let lang = options.lang;
         let bin_path = Self::build(options)?;
 
         let mut child = Command::new(&bin_path)
             .args(run_args)
             .spawn()
-            .map_err(|e| format!("Failed to execute '{}': {}", bin_path.display(), e))?;
+            .map_err(|e| i18n::msg_failed_execute_bin(lang, &bin_path.display().to_string(), &e.to_string()))?;
 
-        let status = child.wait().map_err(|e| format!("Execution failed: {}", e))?;
+        let status = child.wait().map_err(|e| i18n::msg_execution_failed(lang, &e.to_string()))?;
 
         // If executable was created in a temp dir or default, leave or clean up
         Ok(status.code().unwrap_or(-1))

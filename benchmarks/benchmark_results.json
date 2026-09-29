@@ -1,0 +1,254 @@
+[
+  {
+    "name": "C (GCC 16.1)",
+    "lang": "C",
+    "benchmarks": {
+      "fib": {
+        "compile_time_s": 0.05587033600022551,
+        "binary_size_kb": 14.1328125,
+        "runtime_s": 0.1706995763318749
+      },
+      "sieve": {
+        "compile_time_s": 0.07468354999946314,
+        "binary_size_kb": 14.15625,
+        "runtime_s": 0.1978207989996008
+      },
+      "mandel": {
+        "compile_time_s": 0.04868394200093462,
+        "binary_size_kb": 14.1328125,
+        "runtime_s": 0.0466711190007724
+      }
+    }
+  },
+  {
+    "name": "C (Clang 22.1)",
+    "lang": "C",
+    "benchmarks": {
+      "fib": {
+        "compile_time_s": 0.04852420899987919,
+        "binary_size_kb": 14.1484375,
+        "runtime_s": 0.2818283280006047
+      },
+      "sieve": {
+        "compile_time_s": 0.0819983740002499,
+        "binary_size_kb": 14.171875,
+        "runtime_s": 0.1638135900005485
+      },
+      "mandel": {
+        "compile_time_s": 0.05630778799968539,
+        "binary_size_kb": 14.1484375,
+        "runtime_s": 0.0480598079993797
+      }
+    }
+  },
+  {
+    "name": "C++ (G++ 16.1)",
+    "lang": "C++",
+    "benchmarks": {
+      "fib": {
+        "compile_time_s": 0.29882950500177685,
+        "binary_size_kb": 14.1640625,
+        "runtime_s": 0.16895264233244234
+      },
+      "sieve": {
+        "compile_time_s": 0.3619342490019335,
+        "binary_size_kb": 14.1953125,
+        "runtime_s": 0.1808481159993486
+      },
+      "mandel": {
+        "compile_time_s": 0.29416139099703287,
+        "binary_size_kb": 14.1640625,
+        "runtime_s": 0.04812923233233354
+      }
+    }
+  },
+  {
+    "name": "C++ (Clang++ 22.1)",
+    "lang": "C++",
+    "benchmarks": {
+      "fib": {
+        "compile_time_s": 0.2616862819995731,
+        "binary_size_kb": 14.1796875,
+        "runtime_s": 0.2800605366658904
+      },
+      "sieve": {
+        "compile_time_s": 0.3266991149976093,
+        "binary_size_kb": 14.2109375,
+        "runtime_s": 0.1850787746673935
+      },
+      "mandel": {
+        "compile_time_s": 0.27120312999977614,
+        "binary_size_kb": 14.1796875,
+        "runtime_s": 0.050831432998772165
+      }
+    }
+  },
+  {
+    "name": "Rust (rustc 1.97)",
+    "lang": "Rust",
+    "benchmarks": {
+      "fib": {
+        "compile_time_s": 0.07012584199765115,
+        "binary_size_kb": 335.265625,
+        "runtime_s": 0.3054962620008155
+      },
+      "sieve": {
+        "compile_time_s": 0.11241019700173638,
+        "binary_size_kb": 337.4609375,
+        "runtime_s": 0.20157737933307848
+      },
+      "mandel": {
+        "compile_time_s": 0.06938088999959291,
+        "binary_size_kb": 335.609375,
+        "runtime_s": 0.04716972299987295
+      }
+    }
+  },
+  {
+    "name": "Zig (0.14.0)",
+    "lang": "Zig",
+    "benchmarks": {
+      "fib": {
+        "compile_time_s": 0.22280652299741632,
+        "binary_size_kb": 10.59375,
+        "runtime_s": 0.3321480526671318
+      },
+      "sieve": {
+        "compile_time_s": 6.165484659999493,
+        "binary_size_kb": 209.59375,
+        "runtime_s": 0.1822599069989034
+      },
+      "mandel": {
+        "compile_time_s": 0.23609318300077575,
+        "binary_size_kb": 10.953125,
+        "runtime_s": 0.04633456499990037
+      }
+    }
+  },
+  {
+    "name": "Odin (dev-2026-07)",
+    "lang": "Odin",
+    "benchmarks": {
+      "fib": {
+        "compile_time_s": 1.6794675390010525,
+        "binary_size_kb": 207.5078125,
+        "runtime_s": 0.3325916046657464
+      },
+      "sieve": {
+        "compile_time_s": 1.687810792001983,
+        "binary_size_kb": 207.5078125,
+        "runtime_s": 0.2201491433334013
+      },
+      "mandel": {
+        "compile_time_s": 1.670959959999891,
+        "binary_size_kb": 207.5078125,
+        "runtime_s": 0.048075860000002045
+      }
+    }
+  },
+  {
+    "name": "Go (1.26.5)",
+    "lang": "Go",
+    "benchmarks": {
+      "fib": {
+        "compile_time_s": 0.07921272200110252,
+        "binary_size_kb": 1551.1171875,
+        "runtime_s": 0.3930682123330674
+      },
+      "sieve": {
+        "compile_time_s": 0.07487060199855478,
+        "binary_size_kb": 1551.1171875,
+        "runtime_s": 0.22584071033391714
+      },
+      "mandel": {
+        "compile_time_s": 0.07109321399912005,
+        "binary_size_kb": 1551.1171875,
+        "runtime_s": 0.047852973000165853
+      }
+    }
+  },
+  {
+    "name": "V (0.5.2)",
+    "lang": "V",
+    "benchmarks": {
+      "fib": {
+        "compile_time_s": 2.6786443079981836,
+        "binary_size_kb": 131.828125,
+        "runtime_s": 0.1595102313319027
+      },
+      "sieve": {
+        "compile_time_s": 2.6809938839978713,
+        "binary_size_kb": 131.828125,
+        "runtime_s": 0.1976164843326842
+      },
+      "mandel": {
+        "compile_time_s": 2.691663210000115,
+        "binary_size_kb": 131.828125,
+        "runtime_s": 0.04900010166723708
+      }
+    }
+  },
+  {
+    "name": "Nim (2.2.10)",
+    "lang": "Nim",
+    "benchmarks": {
+      "fib": {
+        "compile_time_s": 0.18984944600015297,
+        "binary_size_kb": 62.4140625,
+        "runtime_s": 0.17939245766683598
+      },
+      "sieve": {
+        "compile_time_s": 0.19103245899896137,
+        "binary_size_kb": 62.4140625,
+        "runtime_s": 0.26660540433294955
+      },
+      "mandel": {
+        "compile_time_s": 0.18910847100050887,
+        "binary_size_kb": 62.4140625,
+        "runtime_s": 0.04732030633264609
+      }
+    }
+  },
+  {
+    "name": "D (LDC2 1.42)",
+    "lang": "D",
+    "benchmarks": {
+      "fib": {
+        "compile_time_s": 0.2824178410010063,
+        "binary_size_kb": 855.484375,
+        "runtime_s": 0.2967696126664426
+      },
+      "sieve": {
+        "compile_time_s": 0.31686143600018113,
+        "binary_size_kb": 855.484375,
+        "runtime_s": 0.18025953266745395
+      },
+      "mandel": {
+        "compile_time_s": 0.2894067110028118,
+        "binary_size_kb": 855.484375,
+        "runtime_s": 0.04817541433415803
+      }
+    }
+  },
+  {
+    "name": "Cez (0.1.0 / LLVM 22)",
+    "lang": "Cez",
+    "benchmarks": {
+      "fib": {
+        "compile_time_s": 0.04320520100009162,
+        "binary_size_kb": 14.1328125,
+        "runtime_s": 0.27666872466700926
+      },
+      "sieve": {
+        "compile_time_s": 0.06498918199940817,
+        "binary_size_kb": 14.15625,
+        "runtime_s": 0.22100156266848595
+      },
+      "mandel": {
+        "compile_time_s": 0.04767397699833964,
+        "binary_size_kb": 14.1328125,
+        "runtime_s": 0.049776001667244905
+      }
+    }
+  }
+]

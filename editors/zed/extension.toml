@@ -1,0 +1,18 @@
+id = "cez"
+name = "Cez"
+version = "0.1.0"
+schema_version = 1
+description = "Cez programming language support for Zed"
+repository = "https://github.com/cez-lang/cez"
+authors = ["Cez Team <cez@example.com>"]
+themes = []
+icon_themes = []
+languages = ["languages/cez"]
+capabilities = []
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
+
+[language_servers.cez-lsp]
+languages = ["Cez"]

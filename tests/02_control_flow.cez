@@ -1,0 +1,57 @@
+package main
+
+extern func puts(s *i8) i32
+
+func check_grade(score int) int {
+    if score >= 90 {
+        return 5
+    } else if score >= 75 {
+        return 4
+    } else if score >= 60 {
+        return 3
+    } else {
+        return 2
+    }
+}
+
+func main() int {
+    puts("=== Test 02: Control Flow ===")
+
+    // If-else ladder
+    if check_grade(95) != 5 { return 1 }
+    if check_grade(80) != 4 { return 2 }
+    if check_grade(65) != 3 { return 3 }
+    if check_grade(45) != 2 { return 4 }
+
+    // Logical operators
+    t := true
+    f := false
+
+    if !(t && !f) { return 5 }
+    if !(f || t) { return 6 }
+    if (t && f) { return 7 }
+    if !(t || f) { return 8 }
+
+    // Complex compound condition
+    val := 42
+    if !((val > 10 && val < 50) || val == 100) {
+        return 9
+    }
+    if (val < 10 || val > 100) && val != 42 {
+        return 10
+    }
+
+    // Nested if
+    outer := 10
+    inner := 20
+    var nested_ok bool = false
+    if outer == 10 {
+        if inner == 20 {
+            nested_ok = true
+        }
+    }
+    if !nested_ok { return 11 }
+
+    puts("[PASS] Test 02: Control Flow passed cleanly")
+    return 0
+}

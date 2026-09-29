@@ -52,7 +52,7 @@ func (l *Lexer) Advance() u8 {
 }
 
 func CanPrecedeSemicolon(k int) bool {
-    if k == TOK_IDENT || k == TOK_INT || k == TOK_STRING || k == TOK_CHAR {
+    if k == TOK_IDENT || k == TOK_INT || k == TOK_FLOAT || k == TOK_STRING || k == TOK_CHAR {
         return true
     }
     if k == TOK_RETURN || k == TOK_BREAK || k == TOK_CONTINUE {
@@ -69,9 +69,9 @@ func (l *Lexer) NextToken() Token {
         if l.pos >= l.len {
             if CanPrecedeSemicolon(l.prev_kind) {
                 l.prev_kind = TOK_SEMICOLON
-                return Token{ kind: TOK_SEMICOLON, line: l.line, col: l.col, int_val: 0, str_val: (*i8)(uintptr(0)) }
+                return MakeToken(TOK_SEMICOLON, l.line, l.col, 0, (*i8)(uintptr(0)))
             }
-            return Token{ kind: TOK_EOF, line: l.line, col: l.col, int_val: 0, str_val: (*i8)(uintptr(0)) }
+            return MakeToken(TOK_EOF, l.line, l.col, 0, (*i8)(uintptr(0)))
         }
 
         ch := l.Peek()
@@ -89,7 +89,7 @@ func (l *Lexer) NextToken() Token {
             l.Advance()
             if CanPrecedeSemicolon(l.prev_kind) {
                 l.prev_kind = TOK_SEMICOLON
-                return Token{ kind: TOK_SEMICOLON, line: cur_line, col: cur_col, int_val: 0, str_val: (*i8)(uintptr(0)) }
+                return MakeToken(TOK_SEMICOLON, cur_line, cur_col, 0, (*i8)(uintptr(0)))
             }
             continue
         }
@@ -110,28 +110,57 @@ func (l *Lexer) NextToken() Token {
         // String literals
         if ch == u8(34) { // '"'
             l.Advance()
-            start_pos := l.pos
+            rem_len := l.len - l.pos + 1
+            s_buf := l.arena.Alloc(rem_len)
+            var out_len usize = 0
             for l.Peek() != u8(34) && l.Peek() != u8(0) {
-                if l.Peek() == u8(92) { // '\\'
-                    l.Advance()
+                c := l.Advance()
+                if c == u8(92) { // '\\'
+                    esc := l.Advance()
+                    if esc == u8(110) { // 'n'
+                        *((*u8)(uintptr(s_buf) + out_len)) = u8(10)
+                    } else if esc == u8(114) { // 'r'
+                        *((*u8)(uintptr(s_buf) + out_len)) = u8(13)
+                    } else if esc == u8(116) { // 't'
+                        *((*u8)(uintptr(s_buf) + out_len)) = u8(9)
+                    } else if esc == u8(92) { // '\\'
+                        *((*u8)(uintptr(s_buf) + out_len)) = u8(92)
+                    } else if esc == u8(34) { // '"'
+                        *((*u8)(uintptr(s_buf) + out_len)) = u8(34)
+                    } else if esc == u8(48) { // '0'
+                        *((*u8)(uintptr(s_buf) + out_len)) = u8(0)
+                    } else if esc == u8(120) { // 'x'
+                        h1 := l.Advance()
+                        h2 := l.Advance()
+                        var byte_val u8 = u8(0)
+                        if h1 >= u8(48) && h1 <= u8(57) { byte_val = (h1 - u8(48)) * u8(16)
+                        } else if h1 >= u8(97) && h1 <= u8(102) { byte_val = (h1 - u8(97) + u8(10)) * u8(16)
+                        } else if h1 >= u8(65) && h1 <= u8(70) { byte_val = (h1 - u8(65) + u8(10)) * u8(16) }
+                        if h2 >= u8(48) && h2 <= u8(57) { byte_val = byte_val + (h2 - u8(48))
+                        } else if h2 >= u8(97) && h2 <= u8(102) { byte_val = byte_val + (h2 - u8(97) + u8(10))
+                        } else if h2 >= u8(65) && h2 <= u8(70) { byte_val = byte_val + (h2 - u8(65) + u8(10)) }
+                        *((*u8)(uintptr(s_buf) + out_len)) = byte_val
+                    } else {
+                        *((*u8)(uintptr(s_buf) + out_len)) = esc
+                    }
+                } else {
+                    *((*u8)(uintptr(s_buf) + out_len)) = c
                 }
-                l.Advance()
+                out_len += 1
             }
-            str_len := l.pos - start_pos
-            l.Advance() // skip closing quote
+            if l.Peek() == u8(34) {
+                l.Advance() // skip closing quote
+            }
+            *((*u8)(uintptr(s_buf) + out_len)) = u8(0)
 
-            // Allocate string in arena
-            s_buf := l.arena.Alloc(str_len + 1)
-            memcpy(s_buf, (*u8)(uintptr(l.src) + start_pos), str_len)
-            *((*u8)(uintptr(s_buf) + str_len)) = u8(0)
-
-            tok := Token{ kind: TOK_STRING, line: cur_line, col: cur_col, int_val: int(str_len), str_val: (*i8)(uintptr(s_buf)) }
+            tok := MakeToken(TOK_STRING, cur_line, cur_col, int(out_len), (*i8)(uintptr(s_buf)))
             l.prev_kind = tok.kind
             return tok
         }
 
         // Numbers
         if ch >= u8(48) && ch <= u8(57) { // '0'..'9'
+            start_num_pos := l.pos
             var val int = 0
             if ch == u8(48) && (l.PeekNext() == u8(120) || l.PeekNext() == u8(88)) { // 0x
                 l.Advance()
@@ -165,8 +194,30 @@ func (l *Lexer) NextToken() Token {
                         break
                     }
                 }
+                if l.Peek() == u8(46) { // '.'
+                    if l.PeekNext() >= u8(48) {
+                        if l.PeekNext() <= u8(57) {
+                            l.Advance() // consume '.'
+                            for {
+                                c := l.Peek()
+                                if (c >= u8(48) && c <= u8(57)) || c == u8(95) {
+                                    l.Advance()
+                                } else {
+                                    break
+                                }
+                            }
+                            f_len := l.pos - start_num_pos
+                            f_buf := malloc(f_len + 1)
+                            memcpy(f_buf, (*u8)(uintptr(l.src) + start_num_pos), f_len)
+                            *((*u8)(uintptr(f_buf) + f_len)) = u8(0)
+                            tok := MakeToken(TOK_FLOAT, cur_line, cur_col, 0, (*i8)(uintptr(f_buf)))
+                            l.prev_kind = tok.kind
+                            return tok
+                        }
+                    }
+                }
             }
-            tok := Token{ kind: TOK_INT, line: cur_line, col: cur_col, int_val: val, str_val: (*i8)(uintptr(0)) }
+            tok := MakeToken(TOK_INT, cur_line, cur_col, val, (*i8)(uintptr(0)))
             l.prev_kind = tok.kind
             return tok
         }
@@ -199,9 +250,13 @@ func (l *Lexer) NextToken() Token {
                 k = TOK_AT_SECTION
             } else if StrEq((*i8)(uintptr(s_buf)), "export") {
                 k = TOK_AT_EXPORT
+            } else if StrEq((*i8)(uintptr(s_buf)), "volatile_store") {
+                k = TOK_AT_VSTORE
+            } else if StrEq((*i8)(uintptr(s_buf)), "volatile_load") {
+                k = TOK_AT_VLOAD
             }
 
-            tok := Token{ kind: k, line: cur_line, col: cur_col, int_val: 0, str_val: (*i8)(uintptr(s_buf)) }
+            tok := MakeToken(k, cur_line, cur_col, 0, (*i8)(uintptr(s_buf)))
             l.prev_kind = tok.kind
             return tok
         }
@@ -258,7 +313,7 @@ func (l *Lexer) NextToken() Token {
                 k = TOK_INLINE_ASM
             }
 
-            tok := Token{ kind: k, line: cur_line, col: cur_col, int_val: 0, str_val: id_str }
+            tok := MakeToken(k, cur_line, cur_col, 0, id_str)
             l.prev_kind = tok.kind
             return tok
         }
@@ -319,7 +374,7 @@ func (l *Lexer) NextToken() Token {
             kind = TOK_RBRACE
         }
 
-        tok := Token{ kind: kind, line: cur_line, col: cur_col, int_val: 0, str_val: (*i8)(uintptr(0)) }
+        tok := MakeToken(kind, cur_line, cur_col, 0, (*i8)(uintptr(0)))
         l.prev_kind = tok.kind
         return tok
     }

@@ -1,0 +1,68 @@
+package main
+
+extern func puts(s *i8) i32
+
+type Point struct {
+    x int
+    y int
+}
+
+func (p *Point) Init(x int, y int) {
+    p.x = x
+    p.y = y
+}
+
+func (p *Point) Add(other Point) Point {
+    var res Point
+    res.x = p.x + other.x
+    res.y = p.y + other.y
+    return res
+}
+
+func (p *Point) DistSq() int {
+    return p.x * p.x + p.y * p.y
+}
+
+type Rect struct {
+    top_left Point
+    width    int
+    height   int
+}
+
+func (r *Rect) Area() int {
+    return r.width * r.height
+}
+
+func (r *Rect) Perimeter() int {
+    return (r.width + r.height) * 2
+}
+
+func main() int {
+    puts("=== Test 05: Structs & Methods ===")
+
+    var p1 Point
+    p1.Init(3, 4)
+    if p1.x != 3 || p1.y != 4 { return 1 }
+    if p1.DistSq() != 25 { return 2 }
+
+    var p2 Point
+    p2.Init(10, 20)
+
+    p3 := p1.Add(p2)
+    if p3.x != 13 || p3.y != 24 { return 3 }
+
+    var r Rect
+    r.top_left.Init(0, 0)
+    r.width = 15
+    r.height = 8
+
+    if r.Area() != 120 { return 4 }
+    if r.Perimeter() != 46 { return 5 }
+
+    // Direct nested field assignment
+    r.top_left.x = 100
+    if r.top_left.x != 100 { return 6 }
+
+    puts("[PASS] Test 05: Structs & Methods passed cleanly")
+    return 0
+}

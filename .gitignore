@@ -4,3 +4,6 @@
 *.elf
 *.bin
 bin/
+/arch/pkg/
+/arch/src/
+/arch/*.pkg.tar.zst

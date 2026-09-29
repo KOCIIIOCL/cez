@@ -1,0 +1,52 @@
+package main
+
+extern func puts(s *i8) i32
+
+func StrLen(s *i8) int {
+    var len int = 0
+    for *((*u8)(uintptr(s) + usize(len))) != u8(0) {
+        len += 1
+    }
+    return len
+}
+
+func StrEq(a *i8, b *i8) bool {
+    var i usize = 0
+    for {
+        ca := *((*u8)(uintptr(a) + i))
+        cb := *((*u8)(uintptr(b) + i))
+        if ca != cb {
+            return false
+        }
+        if ca == u8(0) {
+            return true
+        }
+        i += 1
+    }
+    return false
+}
+
+func main() int {
+    puts("=== Test 08: Strings & Escapes ===")
+
+    s1 := "Hello, Cez!"
+    if StrLen(s1) != 11 { return 1 }
+
+    s2 := "Hello, Cez!"
+    if !StrEq(s1, s2) { return 2 }
+
+    s3 := "Hello, World!"
+    if StrEq(s1, s3) { return 3 }
+
+    // Escape sequences
+    s_escapes := "Line1\nLine2\tTabbed\\Backslash\"Quote"
+    // 'L' is at offset 0
+    if *((*u8)(uintptr(s_escapes) + 0)) != u8(76) { return 4 } // 'L'
+    // '\n' is at offset 5
+    if *((*u8)(uintptr(s_escapes) + 5)) != u8(10) { return 5 } // 10 = '\n'
+    // '\t' is at offset 11
+    if *((*u8)(uintptr(s_escapes) + 11)) != u8(9) { return 6 }  // 9 = '\t'
+
+    puts("[PASS] Test 08: Strings & Escapes passed cleanly")
+    return 0
+}

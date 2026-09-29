@@ -1,0 +1,88 @@
+package fmt
+
+// Standard formatting and I/O for Cez
+extern func printf(fmt *i8, ...) i32
+extern func puts(s *i8) i32
+extern func putchar(c i32) i32
+
+extern func scanf(fmt *i8, ...) i32
+extern func getchar() i32
+
+func Println(s string) {
+    puts(s)
+}
+
+func Print(s string) {
+    printf("%s", s)
+}
+
+func PrintInt(n int) {
+    printf("%ld\n", n)
+}
+
+func PrintChar(c i32) {
+    putchar(c)
+}
+
+// Scanln reads a line from stdin into buf (null-terminated), excluding newline.
+// Returns the number of characters read.
+func Scanln(buf *i8, max_len usize) usize {
+    if max_len <= 1 {
+        if max_len == 1 {
+            *buf = i8(0)
+        }
+        return 0
+    }
+    var count usize = 0
+    max_chars := max_len - 1
+    for count < max_chars {
+        ch := getchar()
+        if ch == -1 || ch == 10 { // EOF or '\n'
+            break
+        }
+        if ch != 13 { // ignore '\r'
+            ptr := (*i8)(uintptr(buf) + count)
+            *ptr = i8(ch)
+            count += 1
+        }
+    }
+    zero_ptr := (*i8)(uintptr(buf) + count)
+    *zero_ptr = i8(0)
+    return count
+}
+
+// ReadLine reads a line from standard input into buf.
+func ReadLine(buf *i8, max_len usize) usize {
+    return Scanln(buf, max_len)
+}
+
+// Scan reads a single whitespace-delimited word into buf.
+func Scan(buf *i8) i32 {
+    return scanf("%s", buf)
+}
+
+// ReadInt reads an integer line from stdin.
+func ReadInt() i64 {
+    var buf [64]i8
+    Scanln(&buf, 64)
+    var res i64 = 0
+    var sign i64 = 1
+    var idx usize = 0
+    first := buf[0]
+    if first == i8(45) { // '-'
+        sign = -1
+        idx = 1
+    } else if first == i8(43) { // '+'
+        idx = 1
+    }
+    for idx < 64 {
+        b := buf[idx]
+        if b < i8(48) || b > i8(57) {
+            break
+        }
+        res = res * 10 + i64(b - i8(48))
+        idx += 1
+    }
+    return res * sign
+}
+

@@ -3,7 +3,9 @@
 mod ast;
 mod codegen;
 mod driver;
+mod i18n;
 mod lexer;
+mod lsp;
 mod parser;
 mod sema;
 mod token;
@@ -14,48 +16,42 @@ use std::env;
 use std::path::PathBuf;
 use std::process;
 
-fn print_help() {
-    println!(
-        r#"Cez Programming Language Compiler (v0.1.0)
-Go syntax, LLVM backend, optimized for OSDev, low-level servers, and lightweight tools.
-
-USAGE:
-    cez <COMMAND> [OPTIONS] <FILE>
-
-COMMANDS:
-    build       Compile a Cez source file to executable or object file
-    run         Compile and run a Cez program
-    check       Typecheck a Cez source file without generating code
-    emit-llvm   Emit LLVM IR (.ll) for a Cez source file
-    version     Print compiler version
-    help        Print this help message
-
-OPTIONS:
-    -o <FILE>           Output file path
-    -O<LEVEL>           Optimization level: 0, 1, 2, 3 (default: 2)
-    --freestanding      Freestanding / bare-metal mode (no libc, custom entrypoint)
-    --target=<TRIPLE>   Target architecture triple (e.g. x86_64-unknown-none-elf)
-    --emit-llvm         Emit LLVM IR instead of compiling
-    --emit-obj          Emit relocatable object file (.o)
-
-EXAMPLES:
-    cez build main.cez -o myapp
-    cez run main.cez
-    cez build kernel.cez --freestanding -o kernel.o
-    cez emit-llvm server.cez -o server.ll
-"#
-    );
-}
-
-fn print_version() {
-    println!("cez version 0.1.0 (LLVM 22 backend)");
-}
-
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let raw_args: Vec<String> = env::args().collect();
+
+    // Extract --lang=... or -L ... if provided
+    let mut cli_lang = None;
+    let mut filtered_args = Vec::new();
+
+    let mut i = 0;
+    while i < raw_args.len() {
+        if i == 0 {
+            filtered_args.push(raw_args[i].clone());
+            i += 1;
+            continue;
+        }
+        if raw_args[i].starts_with("--lang=") {
+            cli_lang = Some(raw_args[i].trim_start_matches("--lang=").to_string());
+        } else if raw_args[i] == "-L" && i + 1 < raw_args.len() {
+            cli_lang = Some(raw_args[i + 1].clone());
+            i += 1;
+        } else {
+            filtered_args.push(raw_args[i].clone());
+        }
+        i += 1;
+    }
+
+    let lang = i18n::Lang::detect(cli_lang.as_deref());
+    let args = filtered_args;
+
+    if args.first().map(|s| s.ends_with("cez-lsp")).unwrap_or(false) && (args.len() < 2 || args[1] == "lsp") {
+        let mut server = lsp::CezLsp::new();
+        server.run();
+        return;
+    }
 
     if args.len() < 2 {
-        print_help();
+        print!("{}", i18n::help_text(lang));
         process::exit(1);
     }
 
@@ -63,14 +59,35 @@ fn main() {
 
     match command.as_str() {
         "version" | "-v" | "--version" => {
-            print_version();
+            println!("{}", i18n::version_text(lang));
         }
         "help" | "-h" | "--help" => {
-            print_help();
+            print!("{}", i18n::help_text(lang));
+        }
+        "lsp" => {
+            let mut server = lsp::CezLsp::new();
+            server.run();
+        }
+        "hosts" | "free-hosts" => {
+            let extra_args = if args.len() > 2 { &args[2..] } else { &[][..] };
+            let status = std::process::Command::new("free-hosts")
+                .args(extra_args)
+                .status()
+                .or_else(|_| {
+                    std::process::Command::new("python3")
+                        .arg("/home/low4rch/cez/tools/free_hosts.py")
+                        .args(extra_args)
+                        .status()
+                });
+            if let Ok(st) = status {
+                if let Some(code) = st.code() {
+                    process::exit(code);
+                }
+            }
         }
         "check" => {
             if args.len() < 3 {
-                eprintln!("Error: 'cez check' requires at least one input file.");
+                eprintln!("{}", i18n::msg_req_input_check(lang));
                 process::exit(1);
             }
             let mut files = Vec::new();
@@ -79,22 +96,23 @@ fn main() {
                     files.push(PathBuf::from(arg));
                 }
             }
-            match Driver::compile_files_to_llvm_ir(&files, "x86_64-unknown-linux-gnu", false) {
+            match Driver::compile_files_to_llvm_ir(&files, "x86_64-unknown-linux-gnu", false, lang) {
                 Ok(_) => {
-                    println!("Check passed: all {} files are valid Cez code.", files.len());
+                    println!("{}", i18n::msg_check_passed(lang, files.len()));
                 }
                 Err(e) => {
-                    eprintln!("Semantic error: {}", e);
+                    eprintln!("{}", i18n::msg_semantic_error(lang, &e));
                     process::exit(1);
                 }
             }
         }
         "emit-llvm" => {
             if args.len() < 3 {
-                eprintln!("Error: 'cez emit-llvm' requires an input file.");
+                eprintln!("{}", i18n::msg_req_input_emit_llvm(lang));
                 process::exit(1);
             }
             let mut options = CompilerOptions::default();
+            options.lang = lang;
             options.emit_llvm = true;
 
             let mut i = 2;
@@ -119,19 +137,20 @@ fn main() {
             }
 
             match Driver::build(options) {
-                Ok(path) => println!("Emitted LLVM IR to {}", path.display()),
+                Ok(path) => println!("{}", i18n::msg_emitted_llvm(lang, &path.display().to_string())),
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    eprintln!("{}", i18n::msg_error(lang, &e));
                     process::exit(1);
                 }
             }
         }
         "build" => {
             if args.len() < 3 {
-                eprintln!("Error: 'cez build' requires an input file.");
+                eprintln!("{}", i18n::msg_req_input_build(lang));
                 process::exit(1);
             }
             let mut options = CompilerOptions::default();
+            options.lang = lang;
 
             let mut i = 2;
             while i < args.len() {
@@ -161,19 +180,20 @@ fn main() {
             }
 
             match Driver::build(options) {
-                Ok(path) => println!("Built successfully: {}", path.display()),
+                Ok(path) => println!("{}", i18n::msg_built_successfully(lang, &path.display().to_string())),
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    eprintln!("{}", i18n::msg_error(lang, &e));
                     process::exit(1);
                 }
             }
         }
         "run" => {
             if args.len() < 3 {
-                eprintln!("Error: 'cez run' requires an input file.");
+                eprintln!("{}", i18n::msg_req_input_run(lang));
                 process::exit(1);
             }
             let mut options = CompilerOptions::default();
+            options.lang = lang;
             let mut run_args = Vec::new();
 
             let mut i = 2;
@@ -196,7 +216,7 @@ fn main() {
             }
 
             if options.input_files.is_empty() {
-                eprintln!("Error: 'cez run' requires at least one input file.");
+                eprintln!("{}", i18n::msg_req_input_run(lang));
                 process::exit(1);
             }
 
@@ -212,13 +232,13 @@ fn main() {
                 }
                 Err(e) => {
                     let _ = std::fs::remove_file(&temp_bin);
-                    eprintln!("Error: {}", e);
+                    eprintln!("{}", i18n::msg_error(lang, &e));
                     process::exit(1);
                 }
             }
         }
         unknown => {
-            eprintln!("Unknown command '{}'. Run 'cez help' for usage.", unknown);
+            eprintln!("{}", i18n::msg_unknown_command(lang, unknown));
             process::exit(1);
         }
     }

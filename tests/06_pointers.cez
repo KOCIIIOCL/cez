@@ -1,0 +1,55 @@
+package main
+
+extern func puts(s *i8) i32
+extern func malloc(size usize) *u8
+extern func free(ptr *u8) void
+
+func swap(a *int, b *int) {
+    tmp := *a
+    *a = *b
+    *b = tmp
+}
+
+func main() int {
+    puts("=== Test 06: Pointers & Indirection ===")
+
+    // 1. Basic dereference & address-of
+    x := 100
+    p := &x
+    if *p != 100 { return 1 }
+
+    *p = 250
+    if x != 250 { return 2 }
+
+    // 2. Swap function via pointers
+    n1 := 42
+    n2 := 99
+    swap(&n1, &n2)
+    if n1 != 99 || n2 != 42 { return 3 }
+
+    // 3. Double indirection
+    pp := &p
+    **pp = 500
+    if x != 500 { return 4 }
+
+    // 4. Pointer arithmetic via uintptr
+    buf := malloc(64)
+    if uintptr(buf) == 0 { return 5 }
+
+    // Write bytes at offsets 0, 1, 2, 3
+    for i := 0; i < 4; i += 1 {
+        byte_ptr := (*u8)(uintptr(buf) + usize(i))
+        *byte_ptr = u8(i * 10 + 5)
+    }
+
+    // Read back and verify
+    if *((*u8)(uintptr(buf) + 0)) != u8(5) { return 6 }
+    if *((*u8)(uintptr(buf) + 1)) != u8(15) { return 7 }
+    if *((*u8)(uintptr(buf) + 2)) != u8(25) { return 8 }
+    if *((*u8)(uintptr(buf) + 3)) != u8(35) { return 9 }
+
+    free(buf)
+
+    puts("[PASS] Test 06: Pointers & Indirection passed cleanly")
+    return 0
+}

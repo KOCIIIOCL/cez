@@ -33,6 +33,8 @@ const NODE_IDENT         int = 148
 const NODE_INLINE_ASM    int = 149
 const NODE_VOLATILE_LOAD int = 150
 const NODE_VOLATILE_STORE int = 151
+const NODE_STRUCT_LIT    int = 152
+const NODE_FLOAT_LIT     int = 153
 
 // AST Node representation in Cez
 type Node struct {

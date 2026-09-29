@@ -22,7 +22,7 @@ func (a *Arena) Init(buf *u8, cap usize) {
 
 func (a *Arena) Alloc(size usize) *u8 {
     // 8-byte alignment
-    aligned_offset := (a.offset + 7) &^ 7
+    aligned_offset := ((a.offset + 7) / 8) * 8
     if aligned_offset + size > a.capacity {
         return (*u8)(uintptr(0)) // Out of memory
     }

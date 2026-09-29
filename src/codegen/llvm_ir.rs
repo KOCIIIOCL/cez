@@ -3,6 +3,18 @@ use crate::sema::*;
 use crate::types::*;
 use std::collections::HashMap;
 
+fn format_llvm_float(f: f64) -> String {
+    let mut s = format!("{:e}", f);
+    if let Some(e_idx) = s.find('e') {
+        if !s[..e_idx].contains('.') {
+            s.insert_str(e_idx, ".0");
+        }
+    } else if !s.contains('.') {
+        s.push_str(".0");
+    }
+    s
+}
+
 pub struct LlvmCodegen {
     target_triple: String,
     is_freestanding: bool,
@@ -14,6 +26,7 @@ pub struct LlvmCodegen {
     defer_stack: Vec<TypedStmt>,
     loop_stack: Vec<(String, String)>, // (post_label, exit_label)
     current_block_terminated: bool,
+    current_func_name: Option<String>,
 }
 
 impl LlvmCodegen {
@@ -29,6 +42,7 @@ impl LlvmCodegen {
             defer_stack: Vec::new(),
             loop_stack: Vec::new(),
             current_block_terminated: false,
+            current_func_name: None,
         }
     }
 
@@ -93,7 +107,7 @@ impl LlvmCodegen {
             let init_str = if let Some(ref init) = g.init {
                 match &init.kind {
                     TypedExprKind::IntLit(n) => format!("{}", n),
-                    TypedExprKind::FloatLit(f) => format!("{:e}", f),
+                    TypedExprKind::FloatLit(f) => format_llvm_float(*f),
                     TypedExprKind::BoolLit(b) => if *b { "true".to_string() } else { "false".to_string() },
                     TypedExprKind::StringLit(s) => {
                         let id = self.string_literals.len();
@@ -155,6 +169,9 @@ impl LlvmCodegen {
             if !func_names.contains(&"memset") {
                 self.emit_line("declare i8* @memset(i8*, i32, i64)");
             }
+            if !func_names.contains(&"exit") {
+                self.emit_line("declare void @exit(i32)");
+            }
             self.emit_line("");
         }
 
@@ -183,8 +200,13 @@ impl LlvmCodegen {
         self.defer_stack.clear();
         self.loop_stack.clear();
         self.current_block_terminated = false;
+        self.current_func_name = Some(f.name.clone());
 
-        let ret_ty_str = f.ret_type.to_llvm_type();
+        let ret_ty_str = if f.name == "main" && f.ret_type == Type::Void && !self.is_freestanding {
+            "i32".to_string()
+        } else {
+            f.ret_type.to_llvm_type()
+        };
 
         let mut param_strs = Vec::new();
         for (name, ty) in &f.params {
@@ -265,7 +287,9 @@ impl LlvmCodegen {
         // If the function has not terminated, execute defers and emit default ret
         if !self.current_block_terminated {
             self.execute_defers();
-            if f.ret_type == Type::Void {
+            if f.name == "main" && f.ret_type == Type::Void && !self.is_freestanding {
+                self.emit_instruction("ret i32 0");
+            } else if f.ret_type == Type::Void {
                 self.emit_instruction("ret void");
             } else if f.name == "main" && f.ret_type.is_integer() {
                 self.emit_instruction("ret i32 0");
@@ -414,6 +438,11 @@ impl LlvmCodegen {
 
                 if let Some(r) = ret_val_reg {
                     self.emit_instruction(&format!("ret {} {}", ret_ty.to_llvm_type(), r));
+                } else if self.current_func_name.as_deref() == Some("main")
+                    && *ret_ty == Type::Void
+                    && !self.is_freestanding
+                {
+                    self.emit_instruction("ret i32 0");
                 } else {
                     self.emit_instruction("ret void");
                 }
@@ -554,7 +583,7 @@ impl LlvmCodegen {
     fn generate_expr(&mut self, expr: &TypedExpr) -> String {
         match &expr.kind {
             TypedExprKind::IntLit(n) => format!("{}", n),
-            TypedExprKind::FloatLit(f) => format!("{:e}", f),
+            TypedExprKind::FloatLit(f) => format_llvm_float(*f),
             TypedExprKind::BoolLit(b) => if *b { "true".to_string() } else { "false".to_string() },
             TypedExprKind::CharLit(c) => format!("{}", *c as u8),
             TypedExprKind::StringLit(s) => {
@@ -615,74 +644,92 @@ impl LlvmCodegen {
                 let res = self.new_reg();
                 let ty_str = lhs.ty.to_llvm_type();
 
+                let is_float = lhs.ty.is_float();
                 let is_signed = lhs.ty.is_signed();
 
-                let inst = match op {
-                    BinaryOp::Add => format!("{} = add {} {}, {}", res, ty_str, l_reg, r_reg),
-                    BinaryOp::Sub => format!("{} = sub {} {}, {}", res, ty_str, l_reg, r_reg),
-                    BinaryOp::Mul => format!("{} = mul {} {}, {}", res, ty_str, l_reg, r_reg),
-                    BinaryOp::Div => {
-                        if is_signed {
-                            format!("{} = sdiv {} {}, {}", res, ty_str, l_reg, r_reg)
-                        } else {
-                            format!("{} = udiv {} {}, {}", res, ty_str, l_reg, r_reg)
-                        }
+                let inst = if is_float {
+                    match op {
+                        BinaryOp::Add => format!("{} = fadd {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Sub => format!("{} = fsub {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Mul => format!("{} = fmul {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Div => format!("{} = fdiv {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Mod => format!("{} = frem {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Eq => format!("{} = fcmp oeq {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::NotEq => format!("{} = fcmp one {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Lt => format!("{} = fcmp olt {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::LtEq => format!("{} = fcmp ole {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Gt => format!("{} = fcmp ogt {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::GtEq => format!("{} = fcmp oge {} {}, {}", res, ty_str, l_reg, r_reg),
+                        _ => format!("{} = fadd {} {}, {}", res, ty_str, l_reg, r_reg),
                     }
-                    BinaryOp::Mod => {
-                        if is_signed {
-                            format!("{} = srem {} {}, {}", res, ty_str, l_reg, r_reg)
-                        } else {
-                            format!("{} = urem {} {}, {}", res, ty_str, l_reg, r_reg)
+                } else {
+                    match op {
+                        BinaryOp::Add => format!("{} = add {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Sub => format!("{} = sub {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Mul => format!("{} = mul {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Div => {
+                            if is_signed {
+                                format!("{} = sdiv {} {}, {}", res, ty_str, l_reg, r_reg)
+                            } else {
+                                format!("{} = udiv {} {}, {}", res, ty_str, l_reg, r_reg)
+                            }
                         }
-                    }
-                    BinaryOp::BitAnd => format!("{} = and {} {}, {}", res, ty_str, l_reg, r_reg),
-                    BinaryOp::BitOr => format!("{} = or {} {}, {}", res, ty_str, l_reg, r_reg),
-                    BinaryOp::BitXor => format!("{} = xor {} {}, {}", res, ty_str, l_reg, r_reg),
-                    BinaryOp::Shl => format!("{} = shl {} {}, {}", res, ty_str, l_reg, r_reg),
-                    BinaryOp::Shr => {
-                        if is_signed {
-                            format!("{} = ashr {} {}, {}", res, ty_str, l_reg, r_reg)
-                        } else {
-                            format!("{} = lshr {} {}, {}", res, ty_str, l_reg, r_reg)
+                        BinaryOp::Mod => {
+                            if is_signed {
+                                format!("{} = srem {} {}, {}", res, ty_str, l_reg, r_reg)
+                            } else {
+                                format!("{} = urem {} {}, {}", res, ty_str, l_reg, r_reg)
+                            }
                         }
-                    }
-                    BinaryOp::Eq => format!("{} = icmp eq {} {}, {}", res, ty_str, l_reg, r_reg),
-                    BinaryOp::NotEq => format!("{} = icmp ne {} {}, {}", res, ty_str, l_reg, r_reg),
-                    BinaryOp::Lt => {
-                        if is_signed {
-                            format!("{} = icmp slt {} {}, {}", res, ty_str, l_reg, r_reg)
-                        } else {
-                            format!("{} = icmp ult {} {}, {}", res, ty_str, l_reg, r_reg)
+                        BinaryOp::BitAnd => format!("{} = and {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::BitOr => format!("{} = or {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::BitXor => format!("{} = xor {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Shl => format!("{} = shl {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Shr => {
+                            if is_signed {
+                                format!("{} = ashr {} {}, {}", res, ty_str, l_reg, r_reg)
+                            } else {
+                                format!("{} = lshr {} {}, {}", res, ty_str, l_reg, r_reg)
+                            }
                         }
-                    }
-                    BinaryOp::LtEq => {
-                        if is_signed {
-                            format!("{} = icmp sle {} {}, {}", res, ty_str, l_reg, r_reg)
-                        } else {
-                            format!("{} = icmp ule {} {}, {}", res, ty_str, l_reg, r_reg)
+                        BinaryOp::Eq => format!("{} = icmp eq {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::NotEq => format!("{} = icmp ne {} {}, {}", res, ty_str, l_reg, r_reg),
+                        BinaryOp::Lt => {
+                            if is_signed {
+                                format!("{} = icmp slt {} {}, {}", res, ty_str, l_reg, r_reg)
+                            } else {
+                                format!("{} = icmp ult {} {}, {}", res, ty_str, l_reg, r_reg)
+                            }
                         }
-                    }
-                    BinaryOp::Gt => {
-                        if is_signed {
-                            format!("{} = icmp sgt {} {}, {}", res, ty_str, l_reg, r_reg)
-                        } else {
-                            format!("{} = icmp ugt {} {}, {}", res, ty_str, l_reg, r_reg)
+                        BinaryOp::LtEq => {
+                            if is_signed {
+                                format!("{} = icmp sle {} {}, {}", res, ty_str, l_reg, r_reg)
+                            } else {
+                                format!("{} = icmp ule {} {}, {}", res, ty_str, l_reg, r_reg)
+                            }
                         }
-                    }
-                    BinaryOp::GtEq => {
-                        if is_signed {
-                            format!("{} = icmp sge {} {}, {}", res, ty_str, l_reg, r_reg)
-                        } else {
-                            format!("{} = icmp uge {} {}, {}", res, ty_str, l_reg, r_reg)
+                        BinaryOp::Gt => {
+                            if is_signed {
+                                format!("{} = icmp sgt {} {}, {}", res, ty_str, l_reg, r_reg)
+                            } else {
+                                format!("{} = icmp ugt {} {}, {}", res, ty_str, l_reg, r_reg)
+                            }
                         }
-                    }
-                    BinaryOp::LogicalAnd => format!("{} = and i1 {}, {}", res, l_reg, r_reg),
-                    BinaryOp::LogicalOr => format!("{} = or i1 {}, {}", res, l_reg, r_reg),
-                    BinaryOp::BitClear => {
-                        // Go's `&^`: a &^ b is a & (~b)
-                        let not_r = self.new_reg();
-                        self.emit_instruction(&format!("{} = xor {} {}, -1", not_r, ty_str, r_reg));
-                        format!("{} = and {} {}, {}", res, ty_str, l_reg, not_r)
+                        BinaryOp::GtEq => {
+                            if is_signed {
+                                format!("{} = icmp sge {} {}, {}", res, ty_str, l_reg, r_reg)
+                            } else {
+                                format!("{} = icmp uge {} {}, {}", res, ty_str, l_reg, r_reg)
+                            }
+                        }
+                        BinaryOp::LogicalAnd => format!("{} = and i1 {}, {}", res, l_reg, r_reg),
+                        BinaryOp::LogicalOr => format!("{} = or i1 {}, {}", res, l_reg, r_reg),
+                        BinaryOp::BitClear => {
+                            // Go's `&^`: a &^ b is a & (~b)
+                            let not_r = self.new_reg();
+                            self.emit_instruction(&format!("{} = xor {} {}, -1", not_r, ty_str, r_reg));
+                            format!("{} = and {} {}, {}", res, ty_str, l_reg, not_r)
+                        }
                     }
                 };
 
@@ -694,12 +741,21 @@ impl LlvmCodegen {
                     UnaryOp::Neg => {
                         let in_reg = self.generate_expr(inner);
                         let res = self.new_reg();
-                        self.emit_instruction(&format!(
-                            "{} = sub {} 0, {}",
-                            res,
-                            inner.ty.to_llvm_type(),
-                            in_reg
-                        ));
+                        if inner.ty.is_float() {
+                            self.emit_instruction(&format!(
+                                "{} = fneg {} {}",
+                                res,
+                                inner.ty.to_llvm_type(),
+                                in_reg
+                            ));
+                        } else {
+                            self.emit_instruction(&format!(
+                                "{} = sub {} 0, {}",
+                                res,
+                                inner.ty.to_llvm_type(),
+                                in_reg
+                            ));
+                        }
                         res
                     }
                     UnaryOp::Not => {
@@ -785,7 +841,19 @@ impl LlvmCodegen {
                 load_reg
             }
             TypedExprKind::Index { target, index } => {
-                let target_ptr = self.generate_expr_ptr(target);
+                let target_ptr = if matches!(target.ty, Type::Pointer(_)) {
+                    self.generate_expr(target)
+                } else if matches!(target.ty, Type::Slice(_)) {
+                    let slice_val = self.generate_expr(target);
+                    let ptr_reg = self.new_reg();
+                    self.emit_instruction(&format!(
+                        "{} = extractvalue {} {}, 0",
+                        ptr_reg, target.ty.to_llvm_type(), slice_val
+                    ));
+                    ptr_reg
+                } else {
+                    self.generate_expr_ptr(target)
+                };
                 let idx_reg = self.generate_expr(index);
 
                 let gep_reg = self.new_reg();
@@ -866,10 +934,69 @@ impl LlvmCodegen {
                 let to_llvm = target_ty.to_llvm_type();
 
                 if in_ty == &Type::String && target_ty.is_pointer() {
+                    let ptr_reg = self.new_reg();
                     self.emit_instruction(&format!(
                         "{} = extractvalue {{ i8*, i64 }} {}, 0",
-                        res, in_reg
+                        ptr_reg, in_reg
                     ));
+                    if to_llvm != "i8*" {
+                        self.emit_instruction(&format!(
+                            "{} = bitcast i8* {} to {}",
+                            res, ptr_reg, to_llvm
+                        ));
+                    } else {
+                        return ptr_reg;
+                    }
+                } else if in_ty == &Type::String && target_ty.is_integer() {
+                    let ptr_reg = self.new_reg();
+                    self.emit_instruction(&format!(
+                        "{} = extractvalue {{ i8*, i64 }} {}, 0",
+                        ptr_reg, in_reg
+                    ));
+                    self.emit_instruction(&format!(
+                        "{} = ptrtoint i8* {} to {}",
+                        res, ptr_reg, to_llvm
+                    ));
+                } else if in_ty.is_float() && target_ty.is_float() {
+                    let from_size = in_ty.size_of();
+                    let to_size = target_ty.size_of();
+                    if from_size < to_size {
+                        self.emit_instruction(&format!(
+                            "{} = fpext {} {} to {}",
+                            res, from_llvm, in_reg, to_llvm
+                        ));
+                    } else if from_size > to_size {
+                        self.emit_instruction(&format!(
+                            "{} = fptrunc {} {} to {}",
+                            res, from_llvm, in_reg, to_llvm
+                        ));
+                    } else {
+                        return in_reg;
+                    }
+                } else if in_ty.is_integer() && target_ty.is_float() {
+                    if in_ty.is_signed() {
+                        self.emit_instruction(&format!(
+                            "{} = sitofp {} {} to {}",
+                            res, from_llvm, in_reg, to_llvm
+                        ));
+                    } else {
+                        self.emit_instruction(&format!(
+                            "{} = uitofp {} {} to {}",
+                            res, from_llvm, in_reg, to_llvm
+                        ));
+                    }
+                } else if in_ty.is_float() && target_ty.is_integer() {
+                    if target_ty.is_signed() {
+                        self.emit_instruction(&format!(
+                            "{} = fptosi {} {} to {}",
+                            res, from_llvm, in_reg, to_llvm
+                        ));
+                    } else {
+                        self.emit_instruction(&format!(
+                            "{} = fptoui {} {} to {}",
+                            res, from_llvm, in_reg, to_llvm
+                        ));
+                    }
                 } else if in_ty.is_integer() && target_ty.is_integer() {
                     let from_size = in_ty.size_of();
                     let to_size = target_ty.size_of();
@@ -1018,7 +1145,19 @@ impl LlvmCodegen {
                 gep_reg
             }
             TypedExprKind::Index { target, index } => {
-                let target_ptr = self.generate_expr_ptr(target);
+                let target_ptr = if matches!(target.ty, Type::Pointer(_)) {
+                    self.generate_expr(target)
+                } else if matches!(target.ty, Type::Slice(_)) {
+                    let slice_val = self.generate_expr(target);
+                    let ptr_reg = self.new_reg();
+                    self.emit_instruction(&format!(
+                        "{} = extractvalue {} {}, 0",
+                        ptr_reg, target.ty.to_llvm_type(), slice_val
+                    ));
+                    ptr_reg
+                } else {
+                    self.generate_expr_ptr(target)
+                };
                 let idx_reg = self.generate_expr(index);
                 let gep_reg = self.new_reg();
                 let elem_llvm = expr.ty.to_llvm_type();

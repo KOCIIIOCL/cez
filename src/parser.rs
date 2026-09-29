@@ -4,11 +4,19 @@ use crate::token::{Span, Token, TokenKind};
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Значения `const`-констант, извлечённые при обходе верхнего уровня.
+    /// Нужны, чтобы размер массива мог быть задан именем константы:
+    /// `const STACK_SIZE u64 = 16384` + `var stack [STACK_SIZE]u8`.
+    const_values: std::collections::HashMap<String, i128>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            const_values: std::collections::HashMap::new(),
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -76,7 +84,39 @@ impl Parser {
     }
 
     pub fn parse_program(&mut self) -> Result<Program, String> {
-        self.skip_semicolons();
+     self.skip_semicolons();
+
+     // 0. Предпросмотр: значения целочисленных констант, чтобы размер
+     // массива мог быть задан именем — `const STACK_SIZE u64 = 16384`.
+     for i in 0..self.tokens.len() {
+         if !matches!(self.tokens[i].kind, TokenKind::Const) {
+             continue;
+         }
+         let name = match self.tokens.get(i + 1) {
+             Some(Token {
+                 kind: TokenKind::Ident(s),
+                 ..
+             }) => s.clone(),
+             _ => continue,
+         };
+         // Пропускаем необязательный тип и ищем '=' до конца объявления.
+         for j in (i + 2)..self.tokens.len() {
+             match &self.tokens[j].kind {
+                 TokenKind::Semicolon | TokenKind::Eof => break,
+                 TokenKind::Assign => {
+                     if let Some(Token {
+                         kind: TokenKind::IntLit(n),
+                         ..
+                     }) = self.tokens.get(j + 1)
+                     {
+                         self.const_values.insert(name, *n);
+                     }
+                     break;
+                 }
+                 _ => {}
+             }
+         }
+     }
 
         // 1. package <name>
         self.consume(&TokenKind::Package, "Expected 'package' declaration at start of file")?;
@@ -372,12 +412,19 @@ impl Parser {
                 let inner = self.parse_type()?;
                 Ok(TypeNode::Slice(Box::new(inner), tok.span))
             } else {
-                // Array: [N]T
+                // Array: [N]T — N может быть целочисленным литералом или
+                // именем константы (const STACK_SIZE u64 = 16384).
                 let size_tok = self.advance();
-                let size = if let TokenKind::IntLit(n) = size_tok.kind {
-                    n as usize
-                } else {
-                    return Err(format!("Expected integer array size at {}", size_tok.span));
+                let size = match size_tok.kind {
+                    TokenKind::IntLit(n) => n as usize,
+                    TokenKind::Ident(ref name) => {
+                        self.const_values.get(name).copied().ok_or_else(|| {
+                            format!("Expected integer array size at {}: unknown const '{}'", size_tok.span, name)
+                        })? as usize
+                    }
+                    _ => {
+                        return Err(format!("Expected integer array size at {}", size_tok.span));
+                    }
                 };
                 self.consume(&TokenKind::RBracket, "Expected ']' after array size")?;
                 let inner = self.parse_type()?;

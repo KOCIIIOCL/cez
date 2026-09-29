@@ -1,0 +1,39 @@
+package main
+
+extern func printf(fmt *i8, ...) i32
+
+func mandelbrot() int {
+    width := 600
+    height := 600
+    max_iter := 200
+    
+    total := 0
+    
+    for py := 0; py < height; py += 1 {
+        y0 := f64(py) / f64(height) * 2.0 - 1.0
+        for px := 0; px < width; px += 1 {
+            x0 := f64(px) / f64(width) * 3.0 - 2.0
+            
+            x := 0.0
+            y := 0.0
+            iter := 0
+            
+            for (x*x + y*y <= 4.0) && (iter < max_iter) {
+                xtemp := x*x - y*y + x0
+                y = 2.0*x*y + y0
+                x = xtemp
+                iter += 1
+            }
+            
+            total += iter
+        }
+    }
+    
+    return total
+}
+
+func main() int {
+    sum := mandelbrot()
+    printf("%ld\n", sum)
+    return 0
+}

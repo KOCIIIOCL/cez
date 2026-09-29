@@ -1,0 +1,49 @@
+package main
+
+extern func puts(s *i8) i32
+
+// We use a global array to record the order in which defers execute
+var g_order [8]int
+var g_idx int = 0
+
+func record(val int) {
+    g_order[g_idx] = val
+    g_idx += 1
+}
+
+func test_defer_order() {
+    defer record(1)
+    defer record(2)
+    defer record(3)
+    // When test_defer_order returns, defers should execute in order: 3, 2, 1
+}
+
+func test_early_return(early bool) int {
+    defer record(10)
+    if early {
+        return 42
+    }
+    defer record(20)
+    return 100
+}
+
+func main() int {
+    puts("=== Test 09: Defer Statement ===")
+
+    test_defer_order()
+
+    // Order must be: 3, 2, 1
+    if g_idx != 3 { return 1 }
+    if g_order[0] != 3 { return 2 }
+    if g_order[1] != 2 { return 3 }
+    if g_order[2] != 1 { return 4 }
+
+    // Test with early return
+    r := test_early_return(true)
+    if r != 42 { return 5 }
+    if g_idx != 4 { return 6 }
+    if g_order[3] != 10 { return 7 }
+
+    puts("[PASS] Test 09: Defer Statement passed cleanly")
+    return 0
+}

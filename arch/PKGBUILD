@@ -1,0 +1,50 @@
+# Maintainer: low4rch
+pkgname=cez
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Compiler for the Cez programming language (Go syntax, LLVM backend for OSDev)"
+arch=('x86_64')
+url="https://github.com/cez-lang/cez"
+license=('MIT')
+depends=('clang' 'llvm')
+makedepends=('cargo' 'rust')
+optdepends=(
+    'zed: Modern code editor with Cez language support'
+    'qemu-system-x86: Run and test bare-metal kernels'
+)
+provides=('cez' 'cez-lsp')
+conflicts=('cez-bin' 'cez-git')
+
+build() {
+    cd "$startdir/.."
+    cargo build --release
+}
+
+package() {
+    cd "$startdir/.."
+
+    # 1. Executable binaries
+    install -Dm755 "target/release/cez" "$pkgdir/usr/bin/cez"
+    ln -sf cez "$pkgdir/usr/bin/cez-lsp"
+
+    # 2. Core standard library
+    install -d "$pkgdir/usr/lib/cez/core"
+    install -Dm644 core/*.cez "$pkgdir/usr/lib/cez/core/"
+
+    # 3. Self-hosted compiler sources
+    install -d "$pkgdir/usr/lib/cez/compiler"
+    install -Dm644 compiler/*.cez "$pkgdir/usr/lib/cez/compiler/"
+
+    # 4. Documentation
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 docs/LANGUAGE.md "$pkgdir/usr/share/doc/$pkgname/LANGUAGE.md"
+    install -Dm644 docs/OSDEV.md "$pkgdir/usr/share/doc/$pkgname/OSDEV.md"
+    install -Dm644 docs/BENCHMARKS_AND_COMPARISON.md "$pkgdir/usr/share/doc/$pkgname/BENCHMARKS_AND_COMPARISON.md"
+
+    # 5. License
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+
+    # 6. Zed Editor extension templates
+    install -d "$pkgdir/usr/share/cez/editors/zed"
+    cp -r editors/zed/* "$pkgdir/usr/share/cez/editors/zed/"
+}
